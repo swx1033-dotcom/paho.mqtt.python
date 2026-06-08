@@ -1,0 +1,334 @@
+diff --git a/examples/selectors_multi_client.py b/examples/selectors_multi_client.py
+new file mode 100644
+index 0000000..731deed
+--- /dev/null
++++ b/examples/selectors_multi_client.py
+@@ -0,0 +1,328 @@
++#!/usr/bin/env python3
++
++import uuid
++import selectors
++from time import time
++from typing import Dict, Tuple, Any
++
++import paho.mqtt.client as mqtt
++
++
++class MqttClientManager:
++    """
++    管理多个 MQTT 客户端，使用 selectors 模块进行高效的 I/O 多路复用。
++    
++    关键特性：
++    - 同时管理多个独立的 MQTT 客户端连接
++    - 正确处理 socket 的注册与注销
++    - 集成定时任务支持（如 keepalive）
++    - 完善的错误处理和重连机制
++    """
++
++    def __init__(self):
++        # 使用 DefaultSelector 自动选择最佳的 I/O 多路复用实现
++        # 在 Linux 上是 epoll，macOS 上是 kqueue，Windows 上是 select
++        self.selector = selectors.DefaultSelector()
++        
++        # 存储客户端信息，key 为客户端实例，value 为该客户端的元数据
++        # 元数据包括：socket、是否需要写入、上次 ping 时间等
++        self.clients: Dict[mqtt.Client, Dict[str, Any]] = {}
++        
++        # 记录下次需要调用 loop_misc 的时间
++        self.next_loop_misc: float = 0.0
++        
++        # 运行标志
++        self.running = False
++
++    def add_client(self, client: mqtt.Client, client_name: str):
++        """
++        添加一个 MQTT 客户端到管理器中，并设置相关回调。
++        
++        常见陷阱：
++        - 必须在调用 connect() 之前设置回调函数
++        - 不要忘记设置 on_socket_open 和 on_socket_close
++        """
++        self.clients[client] = {
++            'name': client_name,
++            'needs_write': False,
++            'next_ping': time() + 60  # 默认 60 秒 keepalive
++        }
++        
++        # 设置 socket 相关回调
++        client.on_socket_open = self._on_socket_open
++        client.on_socket_close = self._on_socket_close
++        client.on_socket_register_write = self._on_socket_register_write
++        client.on_socket_unregister_write = self._on_socket_unregister_write
++        
++        print(f"[Manager] Added client: {client_name}")
++
++    def _on_socket_open(self, client: mqtt.Client, userdata, sock):
++        """
++        当客户端的 socket 打开时调用，将 socket 注册到 selector。
++        
++        关键点：
++        - 始终注册读事件，因为我们需要随时准备接收消息
++        - 初始时不注册写事件，只在需要写入时才注册
++        - 必须使用 sock.fileno() 来确保正确跟踪 socket
++        """
++        client_name = self.clients[client]['name']
++        print(f"[{client_name}] Socket opened, registering for reading")
++        
++        # 注册读事件
++        self.selector.register(sock, selectors.EVENT_READ, client)
++        
++        # 检查是否初始就需要写入
++        if client.want_write():
++            self._on_socket_register_write(client, userdata, sock)
++
++    def _on_socket_close(self, client: mqtt.Client, userdata, sock):
++        """
++        当客户端的 socket 关闭时调用，从 selector 中注销 socket。
++        
++        常见陷阱：
++        - 注销 socket 时必须使用相同的对象
++        - 即使 socket 已经关闭，也必须调用 unregister 以避免 selector 泄漏
++        - 重置 needs_write 标志
++        """
++        client_name = self.clients[client]['name']
++        print(f"[{client_name}] Socket closed, unregistering")
++        
++        try:
++            self.selector.unregister(sock)
++        except KeyError:
++            # 可能已经被注销，忽略错误
++            pass
++        
++        self.clients[client]['needs_write'] = False
++
++    def _on_socket_register_write(self, client: mqtt.Client, userdata, sock):
++        """
++        当需要写入 socket 时调用，在 selector 中添加写事件。
++        
++        关键点：
++        - 使用 mask |= selectors.EVENT_WRITE 来保留已注册的读事件
++        - 不要重新注册整个 socket，而是修改已有的事件掩码
++        """
++        client_name = self.clients[client]['name']
++        print(f"[{client_name}] Registering socket for writing")
++        
++        self.clients[client]['needs_write'] = True
++        
++        try:
++            # 获取当前已注册的事件
++            key = self.selector.get_key(sock)
++            # 添加写事件
++            self.selector.modify(sock, key.events | selectors.EVENT_WRITE, client)
++        except KeyError:
++            # 如果 socket 未注册，同时注册读和写
++            self.selector.register(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, client)
++
++    def _on_socket_unregister_write(self, client: mqtt.Client, userdata, sock):
++        """
++        当不需要写入 socket 时调用，从 selector 中移除写事件。
++        
++        关键点：
++        - 使用 mask & ~selectors.EVENT_WRITE 来清除写事件，保留读事件
++        - 始终保留读事件，因为我们需要持续监听消息
++        """
++        client_name = self.clients[client]['name']
++        print(f"[{client_name}] Unregistering socket for writing")
++        
++        self.clients[client]['needs_write'] = False
++        
++        try:
++            # 获取当前已注册的事件
++            key = self.selector.get_key(sock)
++            # 移除写事件，保留读事件
++            new_events = key.events & ~selectors.EVENT_WRITE
++            self.selector.modify(sock, new_events, client)
++        except KeyError:
++            pass
++
++    def _calculate_timeout(self) -> float:
++        """
++        计算 selector.select() 的超时时间。
++        
++        超时时间应该是：
++        - 不超过 1 秒（避免长时间阻塞）
++        - 不超过所有客户端中最早需要调用 loop_misc 的时间
++        
++        常见陷阱：
++        - 不要设置太长的超时时间，否则定时任务会延迟
++        - 不要设置 0 超时，否则会造成忙等待，消耗大量 CPU
++        """
++        now = time()
++        timeout = 1.0  # 默认最大超时 1 秒
++        
++        # 检查每个客户端的 next_loop_misc 时间
++        for client in self.clients:
++            # loop_misc 应该定期调用以处理 keepalive 等
++            # 我们保守地每秒调用一次
++            client_next = now + 1.0
++            if client_next - now < timeout:
++                timeout = client_next - now
++        
++        # 确保 timeout 不为负值
++        return max(timeout, 0.01)
++
++    def run(self):
++        """
++        主事件循环，使用 selector 监控所有客户端的 socket。
++        
++        工作流程：
++        1. 计算合适的超时时间
++        2. 调用 selector.select() 等待事件
++        3. 处理就绪的 socket 事件
++        4. 调用所有客户端的 loop_misc()
++        5. 重复直到停止
++        """
++        self.running = True
++        print("[Manager] Starting event loop")
++        
++        try:
++            while self.running:
++                # 计算超时时间
++                timeout = self._calculate_timeout()
++                
++                # 等待事件
++                events = self.selector.select(timeout)
++                
++                # 处理就绪的事件
++                for key, mask in events:
++                    client = key.data
++                    client_name = self.clients[client]['name']
++                    
++                    # 处理读事件
++                    if mask & selectors.EVENT_READ:
++                        print(f"[{client_name}] Socket readable, calling loop_read")
++                        client.loop_read()
++                    
++                    # 处理写事件
++                    if mask & selectors.EVENT_WRITE:
++                        print(f"[{client_name}] Socket writable, calling loop_write")
++                        client.loop_write()
++                
++                # 调用所有客户端的 loop_misc
++                # 即使没有 socket 事件，也需要定期调用以处理 keepalive
++                now = time()
++                for client in self.clients:
++                    client.loop_misc()
++                
++        except KeyboardInterrupt:
++            print("\n[Manager] Received keyboard interrupt")
++        finally:
++            self.stop()
++
++    def stop(self):
++        """
++        停止事件循环并清理资源。
++        
++        常见陷阱：
++        - 在断开连接前不要关闭 selector
++        - 确保所有客户端都正确断开连接
++        - 关闭 selector 以释放系统资源
++        """
++        print("[Manager] Stopping...")
++        self.running = False
++        
++        # 断开所有客户端连接
++        for client in self.clients:
++            client_name = self.clients[client]['name']
++            print(f"[{client_name}] Disconnecting")
++            try:
++                client.disconnect()
++                # 给客户端一些时间来发送 DISCONNECT 包
++                client.loop(timeout=1.0)
++            except Exception as e:
++                print(f"[{client_name}] Error disconnecting: {e}")
++        
++        # 关闭 selector
++        self.selector.close()
++        print("[Manager] Stopped")
++
++
++def create_client(client_id: str, topic: str) -> mqtt.Client:
++    """
++    创建一个 MQTT 客户端，设置基本的回调函数。
++    """
++    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
++    
++    def on_connect(client, userdata, flags, reason_code, properties):
++        print(f"[{client_id}] Connected with reason code: {reason_code}")
++        client.subscribe(topic)
++        print(f"[{client_id}] Subscribed to topic: {topic}")
++    
++    def on_message(client, userdata, msg):
++        print(f"[{client_id}] Received message on {msg.topic}: {msg.payload.decode()}")
++    
++    def on_disconnect(client, userdata, flags, reason_code, properties):
++        print(f"[{client_id}] Disconnected: {reason_code}")
++    
++    def on_publish(client, userdata, mid, reason_code, properties):
++        print(f"[{client_id}] Published message (mid: {mid})")
++    
++    client.on_connect = on_connect
++    client.on_message = on_message
++    client.on_disconnect = on_disconnect
++    client.on_publish = on_publish
++    
++    return client
++
++
++def main():
++    """
++    主函数：创建两个 MQTT 客户端并使用 MqttClientManager 管理它们。
++    """
++    print("Starting selectors multi-client example")
++    
++    # 创建管理器
++    manager = MqttClientManager()
++    
++    # 创建两个不同的客户端
++    client1_id = 'paho-mqtt-python/selectors/' + str(uuid.uuid4())[:8]
++    client1_topic = client1_id + '/topic'
++    client1 = create_client(client1_id, client1_topic)
++    
++    client2_id = 'paho-mqtt-python/selectors/' + str(uuid.uuid4())[:8]
++    client2_topic = client2_id + '/topic'
++    client2 = create_client(client2_id, client2_topic)
++    
++    # 添加客户端到管理器
++    manager.add_client(client1, "Client1")
++    manager.add_client(client2, "Client2")
++    
++    # 连接两个客户端
++    print(f"Connecting Client1 to mqtt.eclipseprojects.io:1883")
++    client1.connect('mqtt.eclipseprojects.io', 1883, 60)
++    
++    print(f"Connecting Client2 to mqtt.eclipseprojects.io:1883")
++    client2.connect('mqtt.eclipseprojects.io', 1883, 60)
++    
++    # 启动定时发布任务（在单独的线程中）
++    import threading
++    
++    def publish_task():
++        """定期发布消息的任务"""
++        import time
++        msg_count = 0
++        while manager.running:
++            time.sleep(5)  # 每 5 秒发布一次
++            if not manager.running:
++                break
++            
++            msg_count += 1
++            client1.publish(client1_topic, f"Hello from Client1 (msg {msg_count})")
++            client2.publish(client2_topic, f"Hello from Client2 (msg {msg_count})")
++    
++    publish_thread = threading.Thread(target=publish_task, daemon=True)
++    publish_thread.start()
++    
++    # 运行主事件循环
++    try:
++        manager.run()
++    except KeyboardInterrupt:
++        print("\nExiting...")
++
++
++if __name__ == "__main__":
++    main()

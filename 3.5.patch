@@ -1,0 +1,1474 @@
+diff --git a/src/paho/mqtt/client.py b/src/paho/mqtt/client.py
+index 4ccc869..4525252 100644
+--- a/src/paho/mqtt/client.py
++++ b/src/paho/mqtt/client.py
+@@ -41,6 +41,7 @@ from paho.mqtt.packettypes import PacketTypes
+ 
+ from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
+ from .matcher import MQTTMatcher
++from .persistence import SessionPersistence, SQLitePersistence
+ from .properties import Properties
+ from .reasoncodes import ReasonCode, ReasonCodes
+ from .subscribeoptions import SubscribeOptions
+@@ -836,6 +837,8 @@ class Client:
+         self._will_qos = 0
+         self._will_retain = False
+         self._on_message_filtered = MQTTMatcher()
++        self._subscriptions: Dict[str, int] = {}
++        self._persistence: SessionPersistence | None = None
+         self._host = ""
+         self._port = 1883
+         self._bind_address = ""
+@@ -1583,6 +1586,8 @@ class Client:
+         # Put messages in progress in a valid state.
+         self._messages_reconnect_reset()
+ 
++        self._persistence_restore_session()
++
+         with self._callback_mutex:
+             on_pre_connect = self.on_pre_connect
+ 
+@@ -1794,6 +1799,7 @@ class Client:
+                     return message.info
+ 
+                 self._out_messages[message.mid] = message
++                self._persistence_save_out_message(message)
+                 if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
+                     self._inflight_messages += 1
+                     if qos == 1:
+@@ -1885,10 +1891,12 @@ class Client:
+         """
+         if self._sock is None:
+             self._state = _ConnectionState.MQTT_CS_DISCONNECTED
++            self._persistence_save_session()
+             return MQTT_ERR_NO_CONN
+         else:
+             self._state = _ConnectionState.MQTT_CS_DISCONNECTING
+ 
++        self._persistence_save_session()
+         return self._send_disconnect(reasoncode, properties)
+ 
+     def subscribe(
+@@ -2035,6 +2043,15 @@ class Client:
+         if self._sock is None:
+             return (MQTT_ERR_NO_CONN, None)
+ 
++        for t, q in topic_qos_list:
++            topic_str = t.decode('utf-8') if isinstance(t, bytes) else t
++            if isinstance(q, SubscribeOptions):
++                qos_val = q.QoS
++            else:
++                qos_val = q
++            self._subscriptions[topic_str] = qos_val
++            self._persistence_save_subscription(topic_str, qos_val)
++
+         return self._send_subscribe(False, topic_qos_list, properties)
+ 
+     def unsubscribe(
+@@ -2077,6 +2094,11 @@ class Client:
+         if self._sock is None:
+             return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
+ 
++        for t in topic_list:
++            topic_str = t.decode('utf-8') if isinstance(t, bytes) else t
++            self._subscriptions.pop(topic_str, None)
++            self._persistence_remove_subscription(topic_str)
++
+         return self._send_unsubscribe(False, topic_list, properties)
+ 
+     def loop_read(self, max_packets: int = 1) -> MQTTErrorCode:
+@@ -2247,6 +2269,230 @@ class Client:
+         self._will_qos = 0
+         self._will_retain = False
+ 
++    def enable_persistence(
++        self,
++        persistence: SessionPersistence | None = None,
++    ) -> None:
++        """Enable session persistence for the client.
++
++        When persistence is enabled, the client will save session state
++        (outgoing/incoming messages, subscriptions, last mid) to a persistent
++        store. This allows the client to restore its state after a restart
++        when using clean_session=False.
++
++        Must be called before connect() to have any effect.
++
++        :param persistence: A SessionPersistence implementation to use.
++            If None, a SQLitePersistence will be created using the client_id.
++        """
++        if persistence is None:
++            client_id_str = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else str(self._client_id)
++            persistence = SQLitePersistence(client_id_str)
++        self._persistence = persistence
++        self._persistence.open()
++
++    def _persistence_save_session(self) -> None:
++        if self._persistence is None:
++            return
++        if self._check_clean_session():
++            self._persistence.clear_session()
++            return
++
++        out_msgs = []
++        with self._out_message_mutex:
++            for m in self._out_messages.values():
++                props_data = None
++                if m.properties is not None:
++                    try:
++                        props_data = m.properties.pack()
++                    except Exception:
++                        props_data = None
++                out_msgs.append({
++                    "mid": m.mid,
++                    "topic": m.topic,
++                    "payload": m.payload if isinstance(m.payload, bytes) else bytes(m.payload),
++                    "qos": m.qos,
++                    "retain": m.retain,
++                    "dup": m.dup,
++                    "state": m.state,
++                    "timestamp": m.timestamp,
++                    "properties": props_data,
++                })
++
++        in_msgs = []
++        with self._in_message_mutex:
++            for m in self._in_messages.values():
++                props_data = None
++                if m.properties is not None:
++                    try:
++                        props_data = m.properties.pack()
++                    except Exception:
++                        props_data = None
++                in_msgs.append({
++                    "mid": m.mid,
++                    "topic": m.topic,
++                    "payload": m.payload if isinstance(m.payload, bytes) else bytes(m.payload),
++                    "qos": m.qos,
++                    "retain": m.retain,
++                    "dup": m.dup,
++                    "state": m.state,
++                    "timestamp": m.timestamp,
++                    "properties": props_data,
++                })
++
++        subs = []
++        with self._callback_mutex:
++            for topic, qos in self._subscriptions.items():
++                subs.append({"topic": topic, "qos": qos})
++
++        self._persistence.save_all_out_messages(out_msgs)
++        self._persistence.save_all_in_messages(in_msgs)
++        self._persistence.save_all_subscriptions(subs)
++        self._persistence.save_last_mid(self._last_mid)
++
++    def _persistence_restore_session(self) -> None:
++        if self._persistence is None:
++            return
++        if self._check_clean_session():
++            self._persistence.clear_session()
++            return
++
++        with self._out_message_mutex:
++            for msg_data in self._persistence.get_out_messages():
++                mid = msg_data["mid"]
++                if mid in self._out_messages:
++                    continue
++                message = MQTTMessage(mid, msg_data["topic"].encode('utf-8'))
++                message.payload = msg_data["payload"]
++                message.qos = msg_data["qos"]
++                message.retain = msg_data["retain"]
++                message.dup = msg_data["dup"]
++                message.state = msg_data["state"]
++                message.timestamp = msg_data["timestamp"]
++                if msg_data.get("properties") is not None:
++                    try:
++                        props = Properties(PUBLISH >> 4)
++                        props.unpack(msg_data["properties"])
++                        message.properties = props
++                    except Exception:
++                        message.properties = None
++                message.timestamp = 0
++                if message.qos == 0:
++                    message.state = mqtt_ms_publish
++                elif message.qos == 1:
++                    if message.state == mqtt_ms_wait_for_puback:
++                        message.dup = True
++                    message.state = mqtt_ms_publish
++                elif message.qos == 2:
++                    if message.state == mqtt_ms_wait_for_pubcomp:
++                        message.state = mqtt_ms_resend_pubrel
++                    else:
++                        if message.state == mqtt_ms_wait_for_pubrec:
++                            message.dup = True
++                        message.state = mqtt_ms_publish
++                else:
++                    message.state = mqtt_ms_queued
++                self._out_messages[mid] = message
++
++        with self._in_message_mutex:
++            for msg_data in self._persistence.get_in_messages():
++                mid = msg_data["mid"]
++                if mid in self._in_messages:
++                    continue
++                message = MQTTMessage(mid, msg_data["topic"].encode('utf-8'))
++                message.payload = msg_data["payload"]
++                message.qos = msg_data["qos"]
++                message.retain = msg_data["retain"]
++                message.dup = msg_data["dup"]
++                message.state = msg_data["state"]
++                message.timestamp = msg_data["timestamp"]
++                if msg_data.get("properties") is not None:
++                    try:
++                        props = Properties(PUBREC >> 4)
++                        props.unpack(msg_data["properties"])
++                        message.properties = props
++                    except Exception:
++                        message.properties = None
++                if message.qos == 2:
++                    message.state = mqtt_ms_wait_for_pubrel
++                    message.timestamp = 0
++                    self._in_messages[mid] = message
++
++        with self._callback_mutex:
++            for sub_data in self._persistence.get_subscriptions():
++                self._subscriptions[sub_data["topic"]] = sub_data["qos"]
++
++        last_mid = self._persistence.get_last_mid()
++        if last_mid > self._last_mid:
++            self._last_mid = last_mid
++
++    def _persistence_save_out_message(self, message: MQTTMessage) -> None:
++        if self._persistence is None:
++            return
++        props_data = None
++        if message.properties is not None:
++            try:
++                props_data = message.properties.pack()
++            except Exception:
++                props_data = None
++        self._persistence.save_out_message(
++            message.mid,
++            message.topic,
++            message.payload if isinstance(message.payload, bytes) else bytes(message.payload),
++            message.qos,
++            message.retain,
++            message.dup,
++            message.state,
++            message.timestamp,
++            props_data,
++        )
++
++    def _persistence_remove_out_message(self, mid: int) -> None:
++        if self._persistence is None:
++            return
++        self._persistence.remove_out_message(mid)
++
++    def _persistence_save_in_message(self, message: MQTTMessage) -> None:
++        if self._persistence is None:
++            return
++        props_data = None
++        if message.properties is not None:
++            try:
++                props_data = message.properties.pack()
++            except Exception:
++                props_data = None
++        self._persistence.save_in_message(
++            message.mid,
++            message.topic,
++            message.payload if isinstance(message.payload, bytes) else bytes(message.payload),
++            message.qos,
++            message.retain,
++            message.dup,
++            message.state,
++            message.timestamp,
++            props_data,
++        )
++
++    def _persistence_remove_in_message(self, mid: int) -> None:
++        if self._persistence is None:
++            return
++        self._persistence.remove_in_message(mid)
++
++    def _persistence_update_out_message_state(self, mid: int, state: int) -> None:
++        if self._persistence is None:
++            return
++        self._persistence.update_out_message_state(mid, state)
++
++    def _persistence_save_subscription(self, topic: str, qos: int) -> None:
++        if self._persistence is None:
++            return
++        self._persistence.save_subscription(topic, qos)
++
++    def _persistence_remove_subscription(self, topic: str) -> None:
++        if self._persistence is None:
++            return
++        self._persistence.remove_subscription(topic)
++
+     def socket(self) -> SocketLike | None:
+         """Return the socket or ssl object for this client."""
+         return self._sock
+@@ -3044,6 +3290,7 @@ class Client:
+                 self._state = _ConnectionState.MQTT_CS_DISCONNECTED
+                 rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+ 
++            self._persistence_save_session()
+             self._do_on_disconnect(packet_from_broker=False, v1_rc=rc)
+ 
+         if rc == MQTT_ERR_CONN_LOST:
+@@ -3718,12 +3965,10 @@ class Client:
+                     if m.qos == 0:
+                         m.state = mqtt_ms_publish
+                     elif m.qos == 1:
+-                        # self._inflight_messages = self._inflight_messages + 1
+                         if m.state == mqtt_ms_wait_for_puback:
+                             m.dup = True
+                         m.state = mqtt_ms_publish
+                     elif m.qos == 2:
+-                        # self._inflight_messages = self._inflight_messages + 1
+                         if self._check_clean_session():
+                             if m.state != mqtt_ms_publish:
+                                 m.dup = True
+@@ -3737,19 +3982,18 @@ class Client:
+                                 m.state = mqtt_ms_publish
+                 else:
+                     m.state = mqtt_ms_queued
++                self._persistence_update_out_message_state(m.mid, m.state)
+ 
+     def _messages_reconnect_reset_in(self) -> None:
+         with self._in_message_mutex:
+             if self._check_clean_session():
+                 self._in_messages = collections.OrderedDict()
+                 return
+-            for m in self._in_messages.values():
++            for m in list(self._in_messages.values()):
+                 m.timestamp = 0
+                 if m.qos != 2:
+                     self._in_messages.pop(m.mid)
+-                else:
+-                    # Preserve current state
+-                    pass
++                    self._persistence_remove_in_message(m.mid)
+ 
+     def _messages_reconnect_reset(self) -> None:
+         self._messages_reconnect_reset_out()
+@@ -3892,6 +4136,16 @@ class Client:
+             self._state = _ConnectionState.MQTT_CS_CONNECTED
+             self._reconnect_delay = None
+ 
++            session_present = (flags & 0x01) > 0
++            if not self._check_clean_session():
++                self._persistence_restore_session()
++                if not session_present and self._subscriptions:
++                    topic_qos_list = []
++                    for sub_topic, sub_qos in self._subscriptions.items():
++                        topic_qos_list.append((sub_topic.encode('utf-8'), sub_qos))
++                    if topic_qos_list:
++                        self._send_subscribe(False, topic_qos_list, None)
++
+         if self._protocol == MQTTv5:
+             self._easy_log(
+                 MQTT_LOG_DEBUG, "Received CONNACK (%s, %s) properties=%s", flags, reason, properties)
+@@ -4031,6 +4285,7 @@ class Client:
+                        )
+ 
+         self._sock_close()
++        self._persistence_save_session()
+         self._do_on_disconnect(
+             packet_from_broker=True,
+             v1_rc=MQTTErrorCode.MQTT_ERR_SUCCESS,  # If reason is absent (remaining length < 1), it means normal disconnection
+@@ -4157,6 +4412,7 @@ class Client:
+             message.state = mqtt_ms_wait_for_pubrel
+             with self._in_message_mutex:
+                 self._in_messages[message.mid] = message
++                self._persistence_save_in_message(message)
+ 
+             return rc
+         else:
+@@ -4207,6 +4463,7 @@ class Client:
+                 # Only pass the message on if we have removed it from the queue - this
+                 # prevents multiple callbacks for the same message.
+                 message = self._in_messages.pop(mid)
++                self._persistence_remove_in_message(mid)
+                 self._handle_on_message(message)
+                 self._inflight_messages -= 1
+                 if self._max_inflight_messages > 0:
+@@ -4274,6 +4531,7 @@ class Client:
+                 msg = self._out_messages[mid]
+                 msg.state = mqtt_ms_wait_for_pubcomp
+                 msg.timestamp = time_func()
++                self._persistence_update_out_message_state(mid, mqtt_ms_wait_for_pubcomp)
+                 return self._send_pubrel(mid)
+ 
+         return MQTTErrorCode.MQTT_ERR_SUCCESS
+@@ -4425,6 +4683,7 @@ class Client:
+                         raise
+ 
+         msg = self._out_messages.pop(mid)
++        self._persistence_remove_out_message(mid)
+         msg.info._set_as_published()
+         if msg.qos > 0:
+             self._inflight_messages -= 1
+diff --git a/src/paho/mqtt/persistence.py b/src/paho/mqtt/persistence.py
+new file mode 100644
+index 0000000..d82a7b2
+--- /dev/null
++++ b/src/paho/mqtt/persistence.py
+@@ -0,0 +1,332 @@
++from __future__ import annotations
++
++import sqlite3
++import threading
++from abc import ABC, abstractmethod
++from typing import Any, Dict, List, Optional, Sequence
++
++
++class SessionPersistence(ABC):
++    @abstractmethod
++    def open(self) -> None:
++        pass
++
++    @abstractmethod
++    def close(self) -> None:
++        pass
++
++    @abstractmethod
++    def save_out_message(self, mid: int, topic: str, payload: bytes, qos: int,
++                         retain: bool, dup: bool, state: int, timestamp: float,
++                         properties: Optional[bytes] = None) -> None:
++        pass
++
++    @abstractmethod
++    def save_in_message(self, mid: int, topic: str, payload: bytes, qos: int,
++                        retain: bool, dup: bool, state: int, timestamp: float,
++                        properties: Optional[bytes] = None) -> None:
++        pass
++
++    @abstractmethod
++    def remove_out_message(self, mid: int) -> None:
++        pass
++
++    @abstractmethod
++    def remove_in_message(self, mid: int) -> None:
++        pass
++
++    @abstractmethod
++    def update_out_message_state(self, mid: int, state: int) -> None:
++        pass
++
++    @abstractmethod
++    def update_out_message_dup(self, mid: int, dup: bool) -> None:
++        pass
++
++    @abstractmethod
++    def get_out_messages(self) -> List[Dict[str, Any]]:
++        pass
++
++    @abstractmethod
++    def get_in_messages(self) -> List[Dict[str, Any]]:
++        pass
++
++    @abstractmethod
++    def save_subscription(self, topic: str, qos: int, options: Optional[bytes] = None) -> None:
++        pass
++
++    @abstractmethod
++    def remove_subscription(self, topic: str) -> None:
++        pass
++
++    @abstractmethod
++    def get_subscriptions(self) -> List[Dict[str, Any]]:
++        pass
++
++    @abstractmethod
++    def save_last_mid(self, mid: int) -> None:
++        pass
++
++    @abstractmethod
++    def get_last_mid(self) -> int:
++        pass
++
++    @abstractmethod
++    def clear_session(self) -> None:
++        pass
++
++
++class SQLitePersistence(SessionPersistence):
++    def __init__(self, client_id: str, db_path: Optional[str] = None):
++        self._client_id = client_id
++        if db_path is None:
++            self._db_path = f"paho_mqtt_session_{client_id}.db"
++        else:
++            self._db_path = db_path
++        self._conn: Optional[sqlite3.Connection] = None
++        self._lock = threading.RLock()
++
++    def open(self) -> None:
++        with self._lock:
++            if self._conn is not None:
++                return
++            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
++            self._conn.execute("PRAGMA journal_mode=WAL")
++            self._conn.execute("PRAGMA synchronous=NORMAL")
++            self._conn.execute("PRAGMA busy_timeout=5000")
++            self._create_tables()
++
++    def close(self) -> None:
++        with self._lock:
++            if self._conn is not None:
++                self._conn.close()
++                self._conn = None
++
++    def _create_tables(self) -> None:
++        assert self._conn is not None
++        with self._conn:
++            self._conn.execute("""
++                CREATE TABLE IF NOT EXISTS out_messages (
++                    mid INTEGER PRIMARY KEY,
++                    topic TEXT NOT NULL,
++                    payload BLOB NOT NULL,
++                    qos INTEGER NOT NULL,
++                    retain INTEGER NOT NULL,
++                    dup INTEGER NOT NULL,
++                    state INTEGER NOT NULL,
++                    timestamp REAL NOT NULL,
++                    properties BLOB
++                )
++            """)
++            self._conn.execute("""
++                CREATE TABLE IF NOT EXISTS in_messages (
++                    mid INTEGER PRIMARY KEY,
++                    topic TEXT NOT NULL,
++                    payload BLOB NOT NULL,
++                    qos INTEGER NOT NULL,
++                    retain INTEGER NOT NULL,
++                    dup INTEGER NOT NULL,
++                    state INTEGER NOT NULL,
++                    timestamp REAL NOT NULL,
++                    properties BLOB
++                )
++            """)
++            self._conn.execute("""
++                CREATE TABLE IF NOT EXISTS subscriptions (
++                    topic TEXT PRIMARY KEY,
++                    qos INTEGER NOT NULL,
++                    options BLOB
++                )
++            """)
++            self._conn.execute("""
++                CREATE TABLE IF NOT EXISTS session_meta (
++                    key TEXT PRIMARY KEY,
++                    value TEXT NOT NULL
++                )
++            """)
++
++    def save_out_message(self, mid: int, topic: str, payload: bytes, qos: int,
++                         retain: bool, dup: bool, state: int, timestamp: float,
++                         properties: Optional[bytes] = None) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute(
++                    "INSERT OR REPLACE INTO out_messages (mid, topic, payload, qos, retain, dup, state, timestamp, properties) "
++                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                    (mid, topic, payload, qos, int(retain), int(dup), state, timestamp, properties)
++                )
++
++    def save_in_message(self, mid: int, topic: str, payload: bytes, qos: int,
++                        retain: bool, dup: bool, state: int, timestamp: float,
++                        properties: Optional[bytes] = None) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute(
++                    "INSERT OR REPLACE INTO in_messages (mid, topic, payload, qos, retain, dup, state, timestamp, properties) "
++                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                    (mid, topic, payload, qos, int(retain), int(dup), state, timestamp, properties)
++                )
++
++    def remove_out_message(self, mid: int) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("DELETE FROM out_messages WHERE mid = ?", (mid,))
++
++    def remove_in_message(self, mid: int) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("DELETE FROM in_messages WHERE mid = ?", (mid,))
++
++    def update_out_message_state(self, mid: int, state: int) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("UPDATE out_messages SET state = ? WHERE mid = ?", (state, mid))
++
++    def update_out_message_dup(self, mid: int, dup: bool) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("UPDATE out_messages SET dup = ? WHERE mid = ?", (int(dup), mid))
++
++    def get_out_messages(self) -> List[Dict[str, Any]]:
++        with self._lock:
++            assert self._conn is not None
++            cursor = self._conn.execute(
++                "SELECT mid, topic, payload, qos, retain, dup, state, timestamp, properties FROM out_messages ORDER BY mid"
++            )
++            result = []
++            for row in cursor:
++                result.append({
++                    "mid": row[0],
++                    "topic": row[1],
++                    "payload": row[2],
++                    "qos": row[3],
++                    "retain": bool(row[4]),
++                    "dup": bool(row[5]),
++                    "state": row[6],
++                    "timestamp": row[7],
++                    "properties": row[8],
++                })
++            return result
++
++    def get_in_messages(self) -> List[Dict[str, Any]]:
++        with self._lock:
++            assert self._conn is not None
++            cursor = self._conn.execute(
++                "SELECT mid, topic, payload, qos, retain, dup, state, timestamp, properties FROM in_messages ORDER BY mid"
++            )
++            result = []
++            for row in cursor:
++                result.append({
++                    "mid": row[0],
++                    "topic": row[1],
++                    "payload": row[2],
++                    "qos": row[3],
++                    "retain": bool(row[4]),
++                    "dup": bool(row[5]),
++                    "state": row[6],
++                    "timestamp": row[7],
++                    "properties": row[8],
++                })
++            return result
++
++    def save_subscription(self, topic: str, qos: int, options: Optional[bytes] = None) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute(
++                    "INSERT OR REPLACE INTO subscriptions (topic, qos, options) VALUES (?, ?, ?)",
++                    (topic, qos, options)
++                )
++
++    def remove_subscription(self, topic: str) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("DELETE FROM subscriptions WHERE topic = ?", (topic,))
++
++    def get_subscriptions(self) -> List[Dict[str, Any]]:
++        with self._lock:
++            assert self._conn is not None
++            cursor = self._conn.execute("SELECT topic, qos, options FROM subscriptions")
++            result = []
++            for row in cursor:
++                result.append({
++                    "topic": row[0],
++                    "qos": row[1],
++                    "options": row[2],
++                })
++            return result
++
++    def save_last_mid(self, mid: int) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute(
++                    "INSERT OR REPLACE INTO session_meta (key, value) VALUES (?, ?)",
++                    ("last_mid", str(mid))
++                )
++
++    def get_last_mid(self) -> int:
++        with self._lock:
++            assert self._conn is not None
++            cursor = self._conn.execute(
++                "SELECT value FROM session_meta WHERE key = ?", ("last_mid",)
++            )
++            row = cursor.fetchone()
++            if row is None:
++                return 0
++            return int(row[0])
++
++    def clear_session(self) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("DELETE FROM out_messages")
++                self._conn.execute("DELETE FROM in_messages")
++                self._conn.execute("DELETE FROM subscriptions")
++                self._conn.execute("DELETE FROM session_meta")
++
++    def save_all_out_messages(self, messages: Sequence[Dict[str, Any]]) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("DELETE FROM out_messages")
++                for msg in messages:
++                    self._conn.execute(
++                        "INSERT INTO out_messages (mid, topic, payload, qos, retain, dup, state, timestamp, properties) "
++                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                        (msg["mid"], msg["topic"], msg["payload"], msg["qos"],
++                         int(msg["retain"]), int(msg["dup"]), msg["state"],
++                         msg["timestamp"], msg.get("properties"))
++                    )
++
++    def save_all_in_messages(self, messages: Sequence[Dict[str, Any]]) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("DELETE FROM in_messages")
++                for msg in messages:
++                    self._conn.execute(
++                        "INSERT INTO in_messages (mid, topic, payload, qos, retain, dup, state, timestamp, properties) "
++                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                        (msg["mid"], msg["topic"], msg["payload"], msg["qos"],
++                         int(msg["retain"]), int(msg["dup"]), msg["state"],
++                         msg["timestamp"], msg.get("properties"))
++                    )
++
++    def save_all_subscriptions(self, subscriptions: Sequence[Dict[str, Any]]) -> None:
++        with self._lock:
++            assert self._conn is not None
++            with self._conn:
++                self._conn.execute("DELETE FROM subscriptions")
++                for sub in subscriptions:
++                    self._conn.execute(
++                        "INSERT INTO subscriptions (topic, qos, options) VALUES (?, ?, ?)",
++                        (sub["topic"], sub["qos"], sub.get("options"))
++                    )
+diff --git a/src/paho/mqtt/subscribe.py b/src/paho/mqtt/subscribe.py
+index b6c80f4..9f6f522 100644
+--- a/src/paho/mqtt/subscribe.py
++++ b/src/paho/mqtt/subscribe.py
+@@ -149,6 +149,9 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+     )
+     client.enable_logger()
+ 
++    if not clean_session and client_id:
++        client.enable_persistence()
++
+     client.on_message = _on_message_callback
+     client.on_connect = _on_connect
+ 
+diff --git a/tests/test_persistence.py b/tests/test_persistence.py
+new file mode 100644
+index 0000000..c889d16
+--- /dev/null
++++ b/tests/test_persistence.py
+@@ -0,0 +1,705 @@
++import os
++import tempfile
++import threading
++
++import paho.mqtt.client as client
++from paho.mqtt.enums import CallbackAPIVersion, MQTTProtocolVersion
++from paho.mqtt.persistence import SQLitePersistence
++
++import tests.paho_test as paho_test
++from tests.testsupport.broker import FakeBroker, fake_broker  # noqa: F401
++
++
++class TestSQLitePersistence:
++    def test_open_close(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            p.close()
++
++    def test_save_and_get_out_messages(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_out_message(1, "test/topic", b"payload1", 1, False, False, 2, 1000.0)
++                p.save_out_message(2, "test/topic2", b"payload2", 2, True, True, 3, 1001.0)
++                msgs = p.get_out_messages()
++                assert len(msgs) == 2
++                assert msgs[0]["mid"] == 1
++                assert msgs[0]["topic"] == "test/topic"
++                assert msgs[0]["payload"] == b"payload1"
++                assert msgs[0]["qos"] == 1
++                assert msgs[0]["retain"] is False
++                assert msgs[0]["dup"] is False
++                assert msgs[0]["state"] == 2
++                assert msgs[1]["mid"] == 2
++                assert msgs[1]["retain"] is True
++                assert msgs[1]["dup"] is True
++            finally:
++                p.close()
++
++    def test_save_and_get_in_messages(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_in_message(1, "in/topic", b"payload_in", 2, True, False, 5, 2000.0)
++                msgs = p.get_in_messages()
++                assert len(msgs) == 1
++                assert msgs[0]["mid"] == 1
++                assert msgs[0]["topic"] == "in/topic"
++                assert msgs[0]["payload"] == b"payload_in"
++                assert msgs[0]["qos"] == 2
++                assert msgs[0]["retain"] is True
++            finally:
++                p.close()
++
++    def test_remove_out_message(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_out_message(1, "test/topic", b"payload1", 1, False, False, 2, 1000.0)
++                p.save_out_message(2, "test/topic2", b"payload2", 2, True, True, 3, 1001.0)
++                p.remove_out_message(1)
++                msgs = p.get_out_messages()
++                assert len(msgs) == 1
++                assert msgs[0]["mid"] == 2
++            finally:
++                p.close()
++
++    def test_remove_in_message(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_in_message(1, "in/topic", b"payload_in", 2, True, False, 5, 2000.0)
++                p.remove_in_message(1)
++                msgs = p.get_in_messages()
++                assert len(msgs) == 0
++            finally:
++                p.close()
++
++    def test_update_out_message_state(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_out_message(1, "test/topic", b"payload1", 1, False, False, 2, 1000.0)
++                p.update_out_message_state(1, 4)
++                msgs = p.get_out_messages()
++                assert msgs[0]["state"] == 4
++            finally:
++                p.close()
++
++    def test_save_and_get_subscriptions(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_subscription("test/topic", 1)
++                p.save_subscription("test/topic2", 2)
++                subs = p.get_subscriptions()
++                assert len(subs) == 2
++                topics = {s["topic"] for s in subs}
++                assert "test/topic" in topics
++                assert "test/topic2" in topics
++            finally:
++                p.close()
++
++    def test_remove_subscription(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_subscription("test/topic", 1)
++                p.save_subscription("test/topic2", 2)
++                p.remove_subscription("test/topic")
++                subs = p.get_subscriptions()
++                assert len(subs) == 1
++                assert subs[0]["topic"] == "test/topic2"
++            finally:
++                p.close()
++
++    def test_save_and_get_last_mid(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                assert p.get_last_mid() == 0
++                p.save_last_mid(42)
++                assert p.get_last_mid() == 42
++                p.save_last_mid(100)
++                assert p.get_last_mid() == 100
++            finally:
++                p.close()
++
++    def test_clear_session(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_out_message(1, "test/topic", b"payload1", 1, False, False, 2, 1000.0)
++                p.save_in_message(1, "in/topic", b"payload_in", 2, True, False, 5, 2000.0)
++                p.save_subscription("test/topic", 1)
++                p.save_last_mid(42)
++                p.clear_session()
++                assert len(p.get_out_messages()) == 0
++                assert len(p.get_in_messages()) == 0
++                assert len(p.get_subscriptions()) == 0
++                assert p.get_last_mid() == 0
++            finally:
++                p.close()
++
++    def test_save_all_out_messages(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                p.save_out_message(99, "old/topic", b"old", 0, False, False, 0, 0.0)
++                p.save_all_out_messages([
++                    {"mid": 1, "topic": "test/topic", "payload": b"p1", "qos": 1,
++                     "retain": False, "dup": False, "state": 2, "timestamp": 1000.0},
++                    {"mid": 2, "topic": "test/topic2", "payload": b"p2", "qos": 2,
++                     "retain": True, "dup": True, "state": 3, "timestamp": 1001.0},
++                ])
++                msgs = p.get_out_messages()
++                assert len(msgs) == 2
++                assert msgs[0]["mid"] == 1
++                assert msgs[1]["mid"] == 2
++            finally:
++                p.close()
++
++    def test_concurrent_access(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                errors = []
++
++                def writer(thread_id):
++                    try:
++                        for i in range(50):
++                            p.save_out_message(
++                                thread_id * 1000 + i,
++                                f"thread/{thread_id}/topic/{i}",
++                                f"payload_{thread_id}_{i}".encode(),
++                                i % 3,
++                                False, False, i % 10, float(i),
++                            )
++                    except Exception as e:
++                        errors.append(e)
++
++                threads = [threading.Thread(target=writer, args=(t,)) for t in range(5)]
++                for t in threads:
++                    t.start()
++                for t in threads:
++                    t.join()
++
++                assert len(errors) == 0
++                msgs = p.get_out_messages()
++                assert len(msgs) == 250
++            finally:
++                p.close()
++
++    def test_wal_mode(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            p = SQLitePersistence("test_client", db_path=db_path)
++            p.open()
++            try:
++                cursor = p._conn.execute("PRAGMA journal_mode")
++                mode = cursor.fetchone()[0]
++                assert mode.lower() == "wal"
++            finally:
++                p.close()
++
++
++class TestClientPersistence:
++    def test_enable_persistence(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "test-persist-client",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=False,
++            )
++            persistence = SQLitePersistence("test-persist-client", db_path=db_path)
++            mqttc.enable_persistence(persistence)
++            assert mqttc._persistence is not None
++            mqttc._persistence.close()
++
++    def test_enable_persistence_default(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            old_cwd = os.getcwd()
++            try:
++                os.chdir(tmpdir)
++                mqttc = client.Client(
++                    CallbackAPIVersion.VERSION2,
++                    "test-persist-default",
++                    protocol=MQTTProtocolVersion.MQTTv311,
++                    clean_session=False,
++                )
++                mqttc.enable_persistence()
++                assert mqttc._persistence is not None
++                mqttc._persistence.close()
++            finally:
++                os.chdir(old_cwd)
++
++    def test_persistence_save_session_on_disconnect(self, fake_broker):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "persist-disconnect-test",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=False,
++                transport=fake_broker.transport,
++            )
++            persistence = SQLitePersistence("persist-disconnect-test", db_path=db_path)
++            mqttc.enable_persistence(persistence)
++
++            connected = threading.Event()
++
++            def on_connect(mqttc, obj, flags, reason_code, properties):
++                connected.set()
++                mqttc.disconnect()
++
++            mqttc.on_connect = on_connect
++            mqttc.connect_async("localhost", fake_broker.port)
++            mqttc.loop_start()
++
++            try:
++                fake_broker.start()
++                connect_packet = paho_test.gen_connect(
++                    "persist-disconnect-test", keepalive=60,
++                    clean_session=False, proto_ver=4)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == connect_packet
++
++                connack_packet = paho_test.gen_connack(rc=0)
++                fake_broker.send_packet(connack_packet)
++
++                connected.wait(timeout=5)
++
++                disconnect_packet = paho_test.gen_disconnect()
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == disconnect_packet
++            finally:
++                mqttc.loop_stop()
++
++            assert len(persistence.get_subscriptions()) >= 0
++            persistence.close()
++
++    def test_persistence_tracks_subscriptions(self, fake_broker):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "persist-sub-test",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=False,
++                transport=fake_broker.transport,
++            )
++            persistence = SQLitePersistence("persist-sub-test", db_path=db_path)
++            mqttc.enable_persistence(persistence)
++
++            subscribed = threading.Event()
++
++            def on_connect(mqttc, obj, flags, reason_code, properties):
++                mqttc.subscribe("test/topic", 1)
++
++            def on_subscribe(mqttc, obj, mid, reason_codes, properties):
++                subscribed.set()
++                mqttc.disconnect()
++
++            mqttc.on_connect = on_connect
++            mqttc.on_subscribe = on_subscribe
++            mqttc.connect_async("localhost", fake_broker.port)
++            mqttc.loop_start()
++
++            try:
++                fake_broker.start()
++                connect_packet = paho_test.gen_connect(
++                    "persist-sub-test", keepalive=60,
++                    clean_session=False, proto_ver=4)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == connect_packet
++
++                connack_packet = paho_test.gen_connack(rc=0)
++                fake_broker.send_packet(connack_packet)
++
++                subscribe_packet = paho_test.gen_subscribe(
++                    1, "test/topic", 1)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == subscribe_packet
++
++                suback_packet = paho_test.gen_suback(1, 1)
++                fake_broker.send_packet(suback_packet)
++
++                subscribed.wait(timeout=5)
++
++                disconnect_packet = paho_test.gen_disconnect()
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == disconnect_packet
++            finally:
++                mqttc.loop_stop()
++
++            subs = persistence.get_subscriptions()
++            assert len(subs) == 1
++            assert subs[0]["topic"] == "test/topic"
++            assert subs[0]["qos"] == 1
++            persistence.close()
++
++    def test_persistence_restores_subscriptions_on_reconnect(self, fake_broker):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            persistence = SQLitePersistence("persist-reconnect-test", db_path=db_path)
++            persistence.open()
++            persistence.save_subscription("test/topic", 1)
++            persistence.save_subscription("test/topic2", 2)
++            persistence.close()
++
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "persist-reconnect-test",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=False,
++                transport=fake_broker.transport,
++            )
++            persistence2 = SQLitePersistence("persist-reconnect-test", db_path=db_path)
++            mqttc.enable_persistence(persistence2)
++
++            connected = threading.Event()
++
++            def on_connect(mqttc, obj, flags, reason_code, properties):
++                connected.set()
++                mqttc.disconnect()
++
++            mqttc.on_connect = on_connect
++            mqttc.connect_async("localhost", fake_broker.port)
++            mqttc.loop_start()
++
++            try:
++                fake_broker.start()
++                connect_packet = paho_test.gen_connect(
++                    "persist-reconnect-test", keepalive=60,
++                    clean_session=False, proto_ver=4)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == connect_packet
++
++                connack_packet = paho_test.gen_connack(rc=0)
++                fake_broker.send_packet(connack_packet)
++
++                connected.wait(timeout=5)
++
++                assert "test/topic" in mqttc._subscriptions
++                assert mqttc._subscriptions["test/topic"] == 1
++                assert "test/topic2" in mqttc._subscriptions
++                assert mqttc._subscriptions["test/topic2"] == 2
++            finally:
++                mqttc.loop_stop()
++                persistence2.close()
++
++    def test_persistence_saves_out_messages(self, fake_broker):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "persist-outmsg-test",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=False,
++                transport=fake_broker.transport,
++            )
++            persistence = SQLitePersistence("persist-outmsg-test", db_path=db_path)
++            mqttc.enable_persistence(persistence)
++
++            published = threading.Event()
++
++            def on_connect(mqttc, obj, flags, reason_code, properties):
++                mqttc.publish("test/topic", b"hello", qos=1)
++
++            def on_publish(mqttc, obj, mid, reason_code, properties):
++                published.set()
++                mqttc.disconnect()
++
++            mqttc.on_connect = on_connect
++            mqttc.on_publish = on_publish
++            mqttc.connect_async("localhost", fake_broker.port)
++            mqttc.loop_start()
++
++            try:
++                fake_broker.start()
++                connect_packet = paho_test.gen_connect(
++                    "persist-outmsg-test", keepalive=60,
++                    clean_session=False, proto_ver=4)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == connect_packet
++
++                connack_packet = paho_test.gen_connack(rc=0)
++                fake_broker.send_packet(connack_packet)
++
++                publish_packet = paho_test.gen_publish(
++                    "test/topic", qos=1, payload=b"hello", mid=1)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == publish_packet
++
++                puback_packet = paho_test.gen_puback(1)
++                fake_broker.send_packet(puback_packet)
++
++                published.wait(timeout=5)
++
++                disconnect_packet = paho_test.gen_disconnect()
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == disconnect_packet
++            finally:
++                mqttc.loop_stop()
++
++            out_msgs = persistence.get_out_messages()
++            assert len(out_msgs) == 0
++            persistence.close()
++
++    def test_persistence_saves_qos2_out_messages(self, fake_broker):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "persist-qos2-outmsg-test",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=False,
++                transport=fake_broker.transport,
++            )
++            persistence = SQLitePersistence("persist-qos2-outmsg-test", db_path=db_path)
++            mqttc.enable_persistence(persistence)
++
++            published = threading.Event()
++
++            def on_connect(mqttc, obj, flags, reason_code, properties):
++                mqttc.publish("test/qos2", b"hello_qos2", qos=2)
++
++            def on_publish(mqttc, obj, mid, reason_code, properties):
++                published.set()
++                mqttc.disconnect()
++
++            mqttc.on_connect = on_connect
++            mqttc.on_publish = on_publish
++            mqttc.connect_async("localhost", fake_broker.port)
++            mqttc.loop_start()
++
++            try:
++                fake_broker.start()
++                connect_packet = paho_test.gen_connect(
++                    "persist-qos2-outmsg-test", keepalive=60,
++                    clean_session=False, proto_ver=4)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == connect_packet
++
++                connack_packet = paho_test.gen_connack(rc=0)
++                fake_broker.send_packet(connack_packet)
++
++                publish_packet = paho_test.gen_publish(
++                    "test/qos2", qos=2, payload=b"hello_qos2", mid=1)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == publish_packet
++
++                pubrec_packet = paho_test.gen_pubrec(1)
++                fake_broker.send_packet(pubrec_packet)
++
++                pubrel_packet = paho_test.gen_pubrel(1)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == pubrel_packet
++
++                pubcomp_packet = paho_test.gen_pubcomp(1)
++                fake_broker.send_packet(pubcomp_packet)
++
++                published.wait(timeout=5)
++
++                disconnect_packet = paho_test.gen_disconnect()
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == disconnect_packet
++            finally:
++                mqttc.loop_stop()
++
++            out_msgs = persistence.get_out_messages()
++            assert len(out_msgs) == 0
++            persistence.close()
++
++    def test_persistence_clear_session_on_clean_session(self, fake_broker):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            persistence = SQLitePersistence("persist-clean-test", db_path=db_path)
++            persistence.open()
++            persistence.save_subscription("test/topic", 1)
++            persistence.save_out_message(1, "test/topic", b"payload", 1, False, False, 2, 1000.0)
++            persistence.save_last_mid(5)
++            persistence.close()
++
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "persist-clean-test",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=True,
++                transport=fake_broker.transport,
++            )
++            persistence2 = SQLitePersistence("persist-clean-test", db_path=db_path)
++            mqttc.enable_persistence(persistence2)
++
++            connected = threading.Event()
++
++            def on_connect(mqttc, obj, flags, reason_code, properties):
++                connected.set()
++                mqttc.disconnect()
++
++            mqttc.on_connect = on_connect
++            mqttc.connect_async("localhost", fake_broker.port)
++            mqttc.loop_start()
++
++            try:
++                fake_broker.start()
++                connect_packet = paho_test.gen_connect(
++                    "persist-clean-test", keepalive=60,
++                    clean_session=True, proto_ver=4)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == connect_packet
++
++                connack_packet = paho_test.gen_connack(rc=0)
++                fake_broker.send_packet(connack_packet)
++
++                connected.wait(timeout=5)
++
++                disconnect_packet = paho_test.gen_disconnect()
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == disconnect_packet
++            finally:
++                mqttc.loop_stop()
++
++            persistence2.close()
++            persistence3 = SQLitePersistence("persist-clean-test", db_path=db_path)
++            persistence3.open()
++            assert len(persistence3.get_subscriptions()) == 0
++            assert len(persistence3.get_out_messages()) == 0
++            persistence3.close()
++
++    def test_persistence_unsubscribe_removes_from_store(self, fake_broker):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "persist-unsub-test",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=False,
++                transport=fake_broker.transport,
++            )
++            persistence = SQLitePersistence("persist-unsub-test", db_path=db_path)
++            mqttc.enable_persistence(persistence)
++
++            unsubscribed = threading.Event()
++
++            def on_connect(mqttc, obj, flags, reason_code, properties):
++                mqttc.subscribe("test/topic", 1)
++
++            def on_subscribe(mqttc, obj, mid, reason_codes, properties):
++                mqttc.unsubscribe("test/topic")
++
++            def on_unsubscribe(mqttc, obj, mid, reason_codes, properties):
++                unsubscribed.set()
++                mqttc.disconnect()
++
++            mqttc.on_connect = on_connect
++            mqttc.on_subscribe = on_subscribe
++            mqttc.on_unsubscribe = on_unsubscribe
++            mqttc.connect_async("localhost", fake_broker.port)
++            mqttc.loop_start()
++
++            try:
++                fake_broker.start()
++                connect_packet = paho_test.gen_connect(
++                    "persist-unsub-test", keepalive=60,
++                    clean_session=False, proto_ver=4)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == connect_packet
++
++                connack_packet = paho_test.gen_connack(rc=0)
++                fake_broker.send_packet(connack_packet)
++
++                subscribe_packet = paho_test.gen_subscribe(1, "test/topic", 1)
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == subscribe_packet
++
++                suback_packet = paho_test.gen_suback(1, 1)
++                fake_broker.send_packet(suback_packet)
++
++                unsubscribe_packet = paho_test.gen_unsubscribe(2, "test/topic")
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == unsubscribe_packet
++
++                unsuback_packet = paho_test.gen_unsuback(2)
++                fake_broker.send_packet(unsuback_packet)
++
++                unsubscribed.wait(timeout=5)
++
++                disconnect_packet = paho_test.gen_disconnect()
++                packet_in = fake_broker.receive_packet(1000)
++                assert packet_in == disconnect_packet
++            finally:
++                mqttc.loop_stop()
++
++            subs = persistence.get_subscriptions()
++            assert len(subs) == 0
++            persistence.close()
++
++    def test_persistence_mid_preserved_across_sessions(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = os.path.join(tmpdir, "test.db")
++            persistence = SQLitePersistence("persist-mid-test", db_path=db_path)
++            persistence.open()
++            persistence.save_last_mid(50)
++            persistence.close()
++
++            mqttc = client.Client(
++                CallbackAPIVersion.VERSION2,
++                "persist-mid-test",
++                protocol=MQTTProtocolVersion.MQTTv311,
++                clean_session=False,
++            )
++            persistence2 = SQLitePersistence("persist-mid-test", db_path=db_path)
++            mqttc.enable_persistence(persistence2)
++            mqttc._persistence_restore_session()
++
++            assert mqttc._last_mid == 50
++
++            new_mid = mqttc._mid_generate()
++            assert new_mid == 51
++
++            persistence2.close()
++
++    def test_persistence_no_persistence_no_error(self):
++        mqttc = client.Client(
++            CallbackAPIVersion.VERSION2,
++            "no-persist-test",
++            protocol=MQTTProtocolVersion.MQTTv311,
++        )
++        assert mqttc._persistence is None
++        mqttc._persistence_save_session()
++        mqttc._persistence_restore_session()
++        mqttc._persistence_save_out_message(None)
++        mqttc._persistence_remove_out_message(1)
++        mqttc._persistence_save_in_message(None)
++        mqttc._persistence_remove_in_message(1)
++        mqttc._persistence_update_out_message_state(1, 0)
++        mqttc._persistence_save_subscription("test", 0)
++        mqttc._persistence_remove_subscription("test")

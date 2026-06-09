@@ -41,6 +41,7 @@ from paho.mqtt.packettypes import PacketTypes
 
 from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
 from .matcher import MQTTMatcher
+from .persistence import SessionPersistence, SQLitePersistence
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
@@ -836,6 +837,8 @@ class Client:
         self._will_qos = 0
         self._will_retain = False
         self._on_message_filtered = MQTTMatcher()
+        self._subscriptions: Dict[str, int] = {}
+        self._persistence: SessionPersistence | None = None
         self._host = ""
         self._port = 1883
         self._bind_address = ""
@@ -1583,6 +1586,8 @@ class Client:
         # Put messages in progress in a valid state.
         self._messages_reconnect_reset()
 
+        self._persistence_restore_session()
+
         with self._callback_mutex:
             on_pre_connect = self.on_pre_connect
 
@@ -1794,6 +1799,7 @@ class Client:
                     return message.info
 
                 self._out_messages[message.mid] = message
+                self._persistence_save_out_message(message)
                 if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
                     self._inflight_messages += 1
                     if qos == 1:
@@ -1885,10 +1891,12 @@ class Client:
         """
         if self._sock is None:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTED
+            self._persistence_save_session()
             return MQTT_ERR_NO_CONN
         else:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTING
 
+        self._persistence_save_session()
         return self._send_disconnect(reasoncode, properties)
 
     def subscribe(
@@ -2035,6 +2043,15 @@ class Client:
         if self._sock is None:
             return (MQTT_ERR_NO_CONN, None)
 
+        for t, q in topic_qos_list:
+            topic_str = t.decode('utf-8') if isinstance(t, bytes) else t
+            if isinstance(q, SubscribeOptions):
+                qos_val = q.QoS
+            else:
+                qos_val = q
+            self._subscriptions[topic_str] = qos_val
+            self._persistence_save_subscription(topic_str, qos_val)
+
         return self._send_subscribe(False, topic_qos_list, properties)
 
     def unsubscribe(
@@ -2076,6 +2093,11 @@ class Client:
 
         if self._sock is None:
             return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
+
+        for t in topic_list:
+            topic_str = t.decode('utf-8') if isinstance(t, bytes) else t
+            self._subscriptions.pop(topic_str, None)
+            self._persistence_remove_subscription(topic_str)
 
         return self._send_unsubscribe(False, topic_list, properties)
 
@@ -2246,6 +2268,230 @@ class Client:
         self._will_payload = b""
         self._will_qos = 0
         self._will_retain = False
+
+    def enable_persistence(
+        self,
+        persistence: SessionPersistence | None = None,
+    ) -> None:
+        """Enable session persistence for the client.
+
+        When persistence is enabled, the client will save session state
+        (outgoing/incoming messages, subscriptions, last mid) to a persistent
+        store. This allows the client to restore its state after a restart
+        when using clean_session=False.
+
+        Must be called before connect() to have any effect.
+
+        :param persistence: A SessionPersistence implementation to use.
+            If None, a SQLitePersistence will be created using the client_id.
+        """
+        if persistence is None:
+            client_id_str = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else str(self._client_id)
+            persistence = SQLitePersistence(client_id_str)
+        self._persistence = persistence
+        self._persistence.open()
+
+    def _persistence_save_session(self) -> None:
+        if self._persistence is None:
+            return
+        if self._check_clean_session():
+            self._persistence.clear_session()
+            return
+
+        out_msgs = []
+        with self._out_message_mutex:
+            for m in self._out_messages.values():
+                props_data = None
+                if m.properties is not None:
+                    try:
+                        props_data = m.properties.pack()
+                    except Exception:
+                        props_data = None
+                out_msgs.append({
+                    "mid": m.mid,
+                    "topic": m.topic,
+                    "payload": m.payload if isinstance(m.payload, bytes) else bytes(m.payload),
+                    "qos": m.qos,
+                    "retain": m.retain,
+                    "dup": m.dup,
+                    "state": m.state,
+                    "timestamp": m.timestamp,
+                    "properties": props_data,
+                })
+
+        in_msgs = []
+        with self._in_message_mutex:
+            for m in self._in_messages.values():
+                props_data = None
+                if m.properties is not None:
+                    try:
+                        props_data = m.properties.pack()
+                    except Exception:
+                        props_data = None
+                in_msgs.append({
+                    "mid": m.mid,
+                    "topic": m.topic,
+                    "payload": m.payload if isinstance(m.payload, bytes) else bytes(m.payload),
+                    "qos": m.qos,
+                    "retain": m.retain,
+                    "dup": m.dup,
+                    "state": m.state,
+                    "timestamp": m.timestamp,
+                    "properties": props_data,
+                })
+
+        subs = []
+        with self._callback_mutex:
+            for topic, qos in self._subscriptions.items():
+                subs.append({"topic": topic, "qos": qos})
+
+        self._persistence.save_all_out_messages(out_msgs)
+        self._persistence.save_all_in_messages(in_msgs)
+        self._persistence.save_all_subscriptions(subs)
+        self._persistence.save_last_mid(self._last_mid)
+
+    def _persistence_restore_session(self) -> None:
+        if self._persistence is None:
+            return
+        if self._check_clean_session():
+            self._persistence.clear_session()
+            return
+
+        with self._out_message_mutex:
+            for msg_data in self._persistence.get_out_messages():
+                mid = msg_data["mid"]
+                if mid in self._out_messages:
+                    continue
+                message = MQTTMessage(mid, msg_data["topic"].encode('utf-8'))
+                message.payload = msg_data["payload"]
+                message.qos = msg_data["qos"]
+                message.retain = msg_data["retain"]
+                message.dup = msg_data["dup"]
+                message.state = msg_data["state"]
+                message.timestamp = msg_data["timestamp"]
+                if msg_data.get("properties") is not None:
+                    try:
+                        props = Properties(PUBLISH >> 4)
+                        props.unpack(msg_data["properties"])
+                        message.properties = props
+                    except Exception:
+                        message.properties = None
+                message.timestamp = 0
+                if message.qos == 0:
+                    message.state = mqtt_ms_publish
+                elif message.qos == 1:
+                    if message.state == mqtt_ms_wait_for_puback:
+                        message.dup = True
+                    message.state = mqtt_ms_publish
+                elif message.qos == 2:
+                    if message.state == mqtt_ms_wait_for_pubcomp:
+                        message.state = mqtt_ms_resend_pubrel
+                    else:
+                        if message.state == mqtt_ms_wait_for_pubrec:
+                            message.dup = True
+                        message.state = mqtt_ms_publish
+                else:
+                    message.state = mqtt_ms_queued
+                self._out_messages[mid] = message
+
+        with self._in_message_mutex:
+            for msg_data in self._persistence.get_in_messages():
+                mid = msg_data["mid"]
+                if mid in self._in_messages:
+                    continue
+                message = MQTTMessage(mid, msg_data["topic"].encode('utf-8'))
+                message.payload = msg_data["payload"]
+                message.qos = msg_data["qos"]
+                message.retain = msg_data["retain"]
+                message.dup = msg_data["dup"]
+                message.state = msg_data["state"]
+                message.timestamp = msg_data["timestamp"]
+                if msg_data.get("properties") is not None:
+                    try:
+                        props = Properties(PUBREC >> 4)
+                        props.unpack(msg_data["properties"])
+                        message.properties = props
+                    except Exception:
+                        message.properties = None
+                if message.qos == 2:
+                    message.state = mqtt_ms_wait_for_pubrel
+                    message.timestamp = 0
+                    self._in_messages[mid] = message
+
+        with self._callback_mutex:
+            for sub_data in self._persistence.get_subscriptions():
+                self._subscriptions[sub_data["topic"]] = sub_data["qos"]
+
+        last_mid = self._persistence.get_last_mid()
+        if last_mid > self._last_mid:
+            self._last_mid = last_mid
+
+    def _persistence_save_out_message(self, message: MQTTMessage) -> None:
+        if self._persistence is None:
+            return
+        props_data = None
+        if message.properties is not None:
+            try:
+                props_data = message.properties.pack()
+            except Exception:
+                props_data = None
+        self._persistence.save_out_message(
+            message.mid,
+            message.topic,
+            message.payload if isinstance(message.payload, bytes) else bytes(message.payload),
+            message.qos,
+            message.retain,
+            message.dup,
+            message.state,
+            message.timestamp,
+            props_data,
+        )
+
+    def _persistence_remove_out_message(self, mid: int) -> None:
+        if self._persistence is None:
+            return
+        self._persistence.remove_out_message(mid)
+
+    def _persistence_save_in_message(self, message: MQTTMessage) -> None:
+        if self._persistence is None:
+            return
+        props_data = None
+        if message.properties is not None:
+            try:
+                props_data = message.properties.pack()
+            except Exception:
+                props_data = None
+        self._persistence.save_in_message(
+            message.mid,
+            message.topic,
+            message.payload if isinstance(message.payload, bytes) else bytes(message.payload),
+            message.qos,
+            message.retain,
+            message.dup,
+            message.state,
+            message.timestamp,
+            props_data,
+        )
+
+    def _persistence_remove_in_message(self, mid: int) -> None:
+        if self._persistence is None:
+            return
+        self._persistence.remove_in_message(mid)
+
+    def _persistence_update_out_message_state(self, mid: int, state: int) -> None:
+        if self._persistence is None:
+            return
+        self._persistence.update_out_message_state(mid, state)
+
+    def _persistence_save_subscription(self, topic: str, qos: int) -> None:
+        if self._persistence is None:
+            return
+        self._persistence.save_subscription(topic, qos)
+
+    def _persistence_remove_subscription(self, topic: str) -> None:
+        if self._persistence is None:
+            return
+        self._persistence.remove_subscription(topic)
 
     def socket(self) -> SocketLike | None:
         """Return the socket or ssl object for this client."""
@@ -3044,6 +3290,7 @@ class Client:
                 self._state = _ConnectionState.MQTT_CS_DISCONNECTED
                 rc = MQTTErrorCode.MQTT_ERR_SUCCESS
 
+            self._persistence_save_session()
             self._do_on_disconnect(packet_from_broker=False, v1_rc=rc)
 
         if rc == MQTT_ERR_CONN_LOST:
@@ -3718,12 +3965,10 @@ class Client:
                     if m.qos == 0:
                         m.state = mqtt_ms_publish
                     elif m.qos == 1:
-                        # self._inflight_messages = self._inflight_messages + 1
                         if m.state == mqtt_ms_wait_for_puback:
                             m.dup = True
                         m.state = mqtt_ms_publish
                     elif m.qos == 2:
-                        # self._inflight_messages = self._inflight_messages + 1
                         if self._check_clean_session():
                             if m.state != mqtt_ms_publish:
                                 m.dup = True
@@ -3737,19 +3982,18 @@ class Client:
                                 m.state = mqtt_ms_publish
                 else:
                     m.state = mqtt_ms_queued
+                self._persistence_update_out_message_state(m.mid, m.state)
 
     def _messages_reconnect_reset_in(self) -> None:
         with self._in_message_mutex:
             if self._check_clean_session():
                 self._in_messages = collections.OrderedDict()
                 return
-            for m in self._in_messages.values():
+            for m in list(self._in_messages.values()):
                 m.timestamp = 0
                 if m.qos != 2:
                     self._in_messages.pop(m.mid)
-                else:
-                    # Preserve current state
-                    pass
+                    self._persistence_remove_in_message(m.mid)
 
     def _messages_reconnect_reset(self) -> None:
         self._messages_reconnect_reset_out()
@@ -3892,6 +4136,16 @@ class Client:
             self._state = _ConnectionState.MQTT_CS_CONNECTED
             self._reconnect_delay = None
 
+            session_present = (flags & 0x01) > 0
+            if not self._check_clean_session():
+                self._persistence_restore_session()
+                if not session_present and self._subscriptions:
+                    topic_qos_list = []
+                    for sub_topic, sub_qos in self._subscriptions.items():
+                        topic_qos_list.append((sub_topic.encode('utf-8'), sub_qos))
+                    if topic_qos_list:
+                        self._send_subscribe(False, topic_qos_list, None)
+
         if self._protocol == MQTTv5:
             self._easy_log(
                 MQTT_LOG_DEBUG, "Received CONNACK (%s, %s) properties=%s", flags, reason, properties)
@@ -4031,6 +4285,7 @@ class Client:
                        )
 
         self._sock_close()
+        self._persistence_save_session()
         self._do_on_disconnect(
             packet_from_broker=True,
             v1_rc=MQTTErrorCode.MQTT_ERR_SUCCESS,  # If reason is absent (remaining length < 1), it means normal disconnection
@@ -4157,6 +4412,7 @@ class Client:
             message.state = mqtt_ms_wait_for_pubrel
             with self._in_message_mutex:
                 self._in_messages[message.mid] = message
+                self._persistence_save_in_message(message)
 
             return rc
         else:
@@ -4207,6 +4463,7 @@ class Client:
                 # Only pass the message on if we have removed it from the queue - this
                 # prevents multiple callbacks for the same message.
                 message = self._in_messages.pop(mid)
+                self._persistence_remove_in_message(mid)
                 self._handle_on_message(message)
                 self._inflight_messages -= 1
                 if self._max_inflight_messages > 0:
@@ -4274,6 +4531,7 @@ class Client:
                 msg = self._out_messages[mid]
                 msg.state = mqtt_ms_wait_for_pubcomp
                 msg.timestamp = time_func()
+                self._persistence_update_out_message_state(mid, mqtt_ms_wait_for_pubcomp)
                 return self._send_pubrel(mid)
 
         return MQTTErrorCode.MQTT_ERR_SUCCESS
@@ -4425,6 +4683,7 @@ class Client:
                         raise
 
         msg = self._out_messages.pop(mid)
+        self._persistence_remove_out_message(mid)
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1

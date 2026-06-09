@@ -149,6 +149,9 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
     )
     client.enable_logger()
 
+    if not clean_session and client_id:
+        client.enable_persistence()
+
     client.on_message = _on_message_callback
     client.on_connect = _on_connect
 

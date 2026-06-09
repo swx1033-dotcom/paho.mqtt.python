@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+This example demonstrates how to manage multiple MQTT clients concurrently
+using the `selectors` module and the `on_socket_*` callbacks.
+It completely avoids threading and relies on a single event loop.
+
+Common pitfalls to avoid:
+1. Not handling socket closures properly: When a socket closes, you MUST unregister
+   it from the selector before creating a new connection, otherwise you'll get
+   a ValueError or Bad file descriptor error.
+2. Forgetting to call `loop_misc()`: Even if there is no socket activity,
+   `loop_misc()` must be called periodically to handle keepalives (PINGREQ/PINGRESP).
+   Therefore, the selector timeout should never be infinite.
+3. Hardcoding a large select timeout: If your application has timed tasks (like
+   publishing every N seconds), make sure the `select` timeout is not larger
+   than the time until your next task.
+4. Not modifying selector events when writability changes: MQTT clients
+   dynamically change their need to write. We use `selector.modify` in
+   `on_socket_register_write` and `on_socket_unregister_write` to adjust
+   the watched events (EVENT_READ vs EVENT_READ | EVENT_WRITE).
+"""
+
+import selectors
+import socket
+import uuid
+import time
+import sys
+
+import paho.mqtt.client as mqtt
+
+# We will use the DefaultSelector which chooses the best implementation for the platform (e.g. epoll, kqueue, select)
+sel = selectors.DefaultSelector()
+
+class MqttClientHandler:
+    def __init__(self, client_id, topic):
+        self.client_id = client_id
+        self.topic = topic
+        
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.client_id)
+        
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.on_disconnect = self.on_disconnect
+        
+        # Register socket callbacks
+        self.client.on_socket_open = self.on_socket_open
+        self.client.on_socket_close = self.on_socket_close
+        self.client.on_socket_register_write = self.on_socket_register_write
+        self.client.on_socket_unregister_write = self.on_socket_unregister_write
+
+        self.disconnected = False
+        self.state = 0
+        self.t = time.time()
+        self.publish_interval = 5.0
+
+    def connect(self, host, port, keepalive=60):
+        print(f"[{self.client_id}] Connecting to {host}:{port}...")
+        self.client.connect(host, port, keepalive)
+        # Optionally tune socket
+        self.client.socket().setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
+        self.t = time.time()
+
+    def on_connect(self, client, userdata, flags, reason_code, properties):
+        print(f"[{self.client_id}] Connected! Subscribing to {self.topic}")
+        client.subscribe(self.topic)
+
+    def on_message(self, client, userdata, msg):
+        if self.state not in {1, 3, 5}:
+            print(f"[{self.client_id}] Got unexpected message: {msg.payload.decode()}")
+            return
+
+        print(f"[{self.client_id}] Got message with len {len(msg.payload)}")
+        self.state += 1
+        self.t = time.time()
+
+    def on_disconnect(self, client, userdata, flags, reason_code, properties):
+        print(f"[{self.client_id}] Disconnected: {reason_code}")
+        self.disconnected = True
+
+    # --- Socket Callbacks ---
+    def on_socket_open(self, client, userdata, sock):
+        print(f"[{self.client_id}] Socket opened. Registering for READ.")
+        # When socket opens, we initially only care about reading
+        sel.register(sock, selectors.EVENT_READ, data=self)
+
+    def on_socket_close(self, client, userdata, sock):
+        print(f"[{self.client_id}] Socket closed. Unregistering.")
+        # When socket closes, unregister it from selector to avoid bad FD errors
+        try:
+            sel.unregister(sock)
+        except Exception as e:
+            print(f"[{self.client_id}] Failed to unregister socket: {e}")
+
+    def on_socket_register_write(self, client, userdata, sock):
+        print(f"[{self.client_id}] Watching socket for WRITABILITY.")
+        # Client has data to send, so we add EVENT_WRITE
+        try:
+            sel.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, data=self)
+        except Exception as e:
+            print(f"[{self.client_id}] Failed to modify socket: {e}")
+
+    def on_socket_unregister_write(self, client, userdata, sock):
+        print(f"[{self.client_id}] Stop watching socket for WRITABILITY.")
+        # Client has sent all data, revert to EVENT_READ only
+        try:
+            sel.modify(sock, selectors.EVENT_READ, data=self)
+        except Exception as e:
+            print(f"[{self.client_id}] Failed to modify socket: {e}")
+
+    def handle_timer(self):
+        """Handle application-specific timed tasks and reconnection."""
+        # Demonstrate reconnect logic if disconnected unexpectedly
+        if self.disconnected and self.state < 6:
+            print(f"[{self.client_id}] Attempting to reconnect...")
+            try:
+                self.client.reconnect()
+                self.disconnected = False
+            except Exception as e:
+                print(f"[{self.client_id}] Reconnect failed: {e}")
+                # Wait before retrying by updating timer
+                self.t = time.time()
+            return
+
+        if self.state in {0, 2, 4}:
+            if time.time() - self.t >= self.publish_interval:
+                print(f"[{self.client_id}] Publishing")
+                self.client.publish(self.topic, b'Hello' * 4000)
+                self.state += 1
+        elif self.state == 6:
+            self.state += 1
+            print(f"[{self.client_id}] Disconnecting gracefully")
+            self.client.disconnect()
+
+    def get_next_timer_delay(self):
+        """Return the time remaining until the next scheduled action."""
+        if self.disconnected and self.state < 6:
+            remaining = self.publish_interval - (time.time() - self.t)
+            return max(0.0, remaining)
+            
+        if self.state in {0, 2, 4}:
+            remaining = self.publish_interval - (time.time() - self.t)
+            return max(0.0, remaining)
+        return 1.0  # Default max timeout
+
+
+def main():
+    # Create two different clients
+    client1 = MqttClientHandler(f'paho-client-1-{uuid.uuid4().hex[:8]}', 'topic/test1')
+    client2 = MqttClientHandler(f'paho-client-2-{uuid.uuid4().hex[:8]}', 'topic/test2')
+
+    client1.connect('mqtt.eclipseprojects.io', 1883, 60)
+    client2.connect('mqtt.eclipseprojects.io', 1883, 60)
+
+    clients = [client1, client2]
+
+    try:
+        # Exit when both clients reach state 7 (done)
+        while not all(c.state >= 7 for c in clients):
+            # Calculate the minimum timeout required by our application timers
+            # We cap the maximum timeout at 1.0 second so that loop_misc() is called frequently enough
+            # to handle keepalives and other background tasks.
+            timeout = 1.0
+            for c in clients:
+                if c.state < 7:
+                    delay = c.get_next_timer_delay()
+                    if delay < timeout:
+                        timeout = delay
+            
+            # Use selector.select(timeout) to wait for I/O events
+            events = sel.select(timeout=timeout)
+            
+            for key, mask in events:
+                handler = key.data
+                if mask & selectors.EVENT_READ:
+                    # Socket is readable
+                    handler.client.loop_read()
+                
+                if mask & selectors.EVENT_WRITE:
+                    # Socket is writable
+                    handler.client.loop_write()
+
+            # Always call loop_misc() for all active clients after select, 
+            # regardless of whether they had I/O events.
+            # This handles keepalives and internal message retries.
+            for c in clients:
+                if c.state < 7:
+                    c.client.loop_misc()
+                    c.handle_timer()
+
+    except KeyboardInterrupt:
+        print("Caught KeyboardInterrupt, exiting...")
+    finally:
+        sel.close()
+        print("Finished")
+
+if __name__ == "__main__":
+    main()

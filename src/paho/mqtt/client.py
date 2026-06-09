@@ -27,6 +27,7 @@ import os
 import platform
 import select
 import socket
+import sqlite3
 import string
 import struct
 import threading
@@ -628,6 +629,286 @@ class MQTTMessage:
         self._topic = value
 
 
+def _pack_persisted_properties(properties: Properties | None) -> bytes | None:
+    if properties is None:
+        return None
+    return properties.pack()
+
+
+def _unpack_persisted_properties(packet_type: int, payload: bytes | None) -> Properties | None:
+    if payload is None:
+        return None
+    properties = Properties(packet_type)
+    properties.unpack(payload)
+    return properties
+
+
+class SessionStore:
+    def load_session(self, client_id: bytes) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    def save_session(self, client_id: bytes, session_state: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def clear_session(self, client_id: bytes) -> None:
+        raise NotImplementedError
+
+
+class SQLiteSessionStore(SessionStore):
+    def __init__(self, path: str, busy_timeout: float = 5.0) -> None:
+        if busy_timeout <= 0:
+            raise ValueError("busy_timeout must be > 0")
+        self._path = path
+        self._busy_timeout = busy_timeout
+        self._lock = threading.RLock()
+        self._initialise()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self._path,
+            timeout=self._busy_timeout,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    def _initialise(self) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS mqtt_sessions (
+                        client_id BLOB PRIMARY KEY,
+                        last_mid INTEGER NOT NULL,
+                        mqttv5_first_connect INTEGER NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS mqtt_session_out_messages (
+                        client_id BLOB NOT NULL,
+                        mid INTEGER NOT NULL,
+                        topic BLOB NOT NULL,
+                        payload BLOB NOT NULL,
+                        qos INTEGER NOT NULL,
+                        retain INTEGER NOT NULL,
+                        dup INTEGER NOT NULL,
+                        state INTEGER NOT NULL,
+                        timestamp REAL NOT NULL,
+                        properties BLOB,
+                        PRIMARY KEY (client_id, mid),
+                        FOREIGN KEY (client_id) REFERENCES mqtt_sessions(client_id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS mqtt_session_in_messages (
+                        client_id BLOB NOT NULL,
+                        mid INTEGER NOT NULL,
+                        topic BLOB NOT NULL,
+                        payload BLOB NOT NULL,
+                        qos INTEGER NOT NULL,
+                        retain INTEGER NOT NULL,
+                        dup INTEGER NOT NULL,
+                        state INTEGER NOT NULL,
+                        timestamp REAL NOT NULL,
+                        properties BLOB,
+                        PRIMARY KEY (client_id, mid),
+                        FOREIGN KEY (client_id) REFERENCES mqtt_sessions(client_id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS mqtt_session_subscriptions (
+                        client_id BLOB NOT NULL,
+                        topic TEXT NOT NULL,
+                        qos INTEGER NOT NULL,
+                        options BLOB,
+                        PRIMARY KEY (client_id, topic),
+                        FOREIGN KEY (client_id) REFERENCES mqtt_sessions(client_id) ON DELETE CASCADE
+                    );
+                    """
+                )
+                conn.commit()
+
+    def save_session(self, client_id: bytes, session_state: dict[str, Any]) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """
+                    INSERT INTO mqtt_sessions (client_id, last_mid, mqttv5_first_connect, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(client_id) DO UPDATE SET
+                        last_mid=excluded.last_mid,
+                        mqttv5_first_connect=excluded.mqttv5_first_connect,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        client_id,
+                        session_state["last_mid"],
+                        int(session_state["mqttv5_first_connect"]),
+                        time.time(),
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM mqtt_session_out_messages WHERE client_id = ?",
+                    (client_id,),
+                )
+                conn.execute(
+                    "DELETE FROM mqtt_session_in_messages WHERE client_id = ?",
+                    (client_id,),
+                )
+                conn.execute(
+                    "DELETE FROM mqtt_session_subscriptions WHERE client_id = ?",
+                    (client_id,),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO mqtt_session_out_messages (
+                        client_id, mid, topic, payload, qos, retain, dup, state, timestamp, properties
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            client_id,
+                            message["mid"],
+                            message["topic"],
+                            message["payload"],
+                            message["qos"],
+                            int(message["retain"]),
+                            int(message["dup"]),
+                            message["state"],
+                            message["timestamp"],
+                            message["properties"],
+                        )
+                        for message in session_state["out_messages"]
+                    ],
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO mqtt_session_in_messages (
+                        client_id, mid, topic, payload, qos, retain, dup, state, timestamp, properties
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            client_id,
+                            message["mid"],
+                            message["topic"],
+                            message["payload"],
+                            message["qos"],
+                            int(message["retain"]),
+                            int(message["dup"]),
+                            message["state"],
+                            message["timestamp"],
+                            message["properties"],
+                        )
+                        for message in session_state["in_messages"]
+                    ],
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO mqtt_session_subscriptions (
+                        client_id, topic, qos, options
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            client_id,
+                            subscription["topic"],
+                            subscription["qos"],
+                            subscription["options"],
+                        )
+                        for subscription in session_state["subscriptions"]
+                    ],
+                )
+                conn.commit()
+
+    def load_session(self, client_id: bytes) -> dict[str, Any] | None:
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT last_mid, mqttv5_first_connect FROM mqtt_sessions WHERE client_id = ?",
+                    (client_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+
+                out_messages = conn.execute(
+                    """
+                    SELECT mid, topic, payload, qos, retain, dup, state, timestamp, properties
+                    FROM mqtt_session_out_messages
+                    WHERE client_id = ?
+                    ORDER BY mid
+                    """,
+                    (client_id,),
+                ).fetchall()
+                in_messages = conn.execute(
+                    """
+                    SELECT mid, topic, payload, qos, retain, dup, state, timestamp, properties
+                    FROM mqtt_session_in_messages
+                    WHERE client_id = ?
+                    ORDER BY mid
+                    """,
+                    (client_id,),
+                ).fetchall()
+                subscriptions = conn.execute(
+                    """
+                    SELECT topic, qos, options
+                    FROM mqtt_session_subscriptions
+                    WHERE client_id = ?
+                    ORDER BY topic
+                    """,
+                    (client_id,),
+                ).fetchall()
+
+        return {
+            "last_mid": row[0],
+            "mqttv5_first_connect": bool(row[1]),
+            "out_messages": [
+                {
+                    "mid": message[0],
+                    "topic": message[1],
+                    "payload": message[2],
+                    "qos": message[3],
+                    "retain": bool(message[4]),
+                    "dup": bool(message[5]),
+                    "state": message[6],
+                    "timestamp": message[7],
+                    "properties": message[8],
+                }
+                for message in out_messages
+            ],
+            "in_messages": [
+                {
+                    "mid": message[0],
+                    "topic": message[1],
+                    "payload": message[2],
+                    "qos": message[3],
+                    "retain": bool(message[4]),
+                    "dup": bool(message[5]),
+                    "state": message[6],
+                    "timestamp": message[7],
+                    "properties": message[8],
+                }
+                for message in in_messages
+            ],
+            "subscriptions": [
+                {
+                    "topic": subscription[0],
+                    "qos": subscription[1],
+                    "options": subscription[2],
+                }
+                for subscription in subscriptions
+            ],
+        }
+
+    def clear_session(self, client_id: bytes) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM mqtt_sessions WHERE client_id = ?", (client_id,))
+                conn.commit()
+
+
 class Client:
     """MQTT version 3.1/3.1.1/5.0 client class.
 
@@ -846,6 +1127,7 @@ class Client:
         self._msgtime_mutex = threading.Lock()
         self._out_message_mutex = threading.RLock()
         self._in_message_mutex = threading.Lock()
+        self._session_mutex = threading.RLock()
         self._reconnect_delay_mutex = threading.Lock()
         self._mid_generate_mutex = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -872,12 +1154,184 @@ class Client:
         self._on_socket_unregister_write: CallbackOnSocket | None = None
         self._websocket_path = "/mqtt"
         self._websocket_extra_headers: WebSocketHeaders | None = None
+        self._subscriptions: collections.OrderedDict[str, int | SubscribeOptions] = collections.OrderedDict()
+        self._session_store: SessionStore | None = None
         # for clean_start == MQTT_CLEAN_START_FIRST_ONLY
         self._mqttv5_first_connect = True
         self.suppress_exceptions = False # For callbacks
 
     def __del__(self) -> None:
         self._reset_sockets()
+
+    def session_store_set(self, session_store: SessionStore | None) -> None:
+        self._session_store = session_store
+
+    def enable_session_persistence(
+        self,
+        path: str,
+        busy_timeout: float = 5.0,
+    ) -> SQLiteSessionStore:
+        session_store = SQLiteSessionStore(path, busy_timeout=busy_timeout)
+        self.session_store_set(session_store)
+        return session_store
+
+    def _session_persistence_enabled(self) -> bool:
+        if self._session_store is None or self._client_id == b"":
+            return False
+        if self._protocol == MQTTv5:
+            return not self._check_clean_session()
+        return not self._clean_session
+
+    def _serialize_message(self, message: MQTTMessage) -> dict[str, Any]:
+        return {
+            "mid": message.mid,
+            "topic": message._topic,
+            "payload": message.payload,
+            "qos": message.qos,
+            "retain": bool(message.retain),
+            "dup": bool(message.dup),
+            "state": int(message.state),
+            "timestamp": message.timestamp,
+            "properties": _pack_persisted_properties(message.properties),
+        }
+
+    def _deserialize_message(self, message_state: dict[str, Any]) -> MQTTMessage:
+        message = MQTTMessage(message_state["mid"], message_state["topic"])
+        message.payload = message_state["payload"]
+        message.qos = message_state["qos"]
+        message.retain = bool(message_state["retain"])
+        message.dup = bool(message_state["dup"])
+        message.state = MessageState(message_state["state"])
+        message.timestamp = message_state["timestamp"]
+        message.properties = _unpack_persisted_properties(
+            PacketTypes.PUBLISH,
+            message_state["properties"],
+        )
+        return message
+
+    def _snapshot_session(self) -> dict[str, Any]:
+        with self._out_message_mutex:
+            out_messages = [self._serialize_message(message) for message in self._out_messages.values()]
+        with self._in_message_mutex:
+            in_messages = [self._serialize_message(message) for message in self._in_messages.values()]
+        with self._session_mutex:
+            subscriptions = []
+            for topic, subscription in self._subscriptions.items():
+                if isinstance(subscription, SubscribeOptions):
+                    subscriptions.append(
+                        {
+                            "topic": topic,
+                            "qos": subscription.QoS,
+                            "options": subscription.pack(),
+                        }
+                    )
+                else:
+                    subscriptions.append(
+                        {
+                            "topic": topic,
+                            "qos": subscription,
+                            "options": None,
+                        }
+                    )
+        return {
+            "last_mid": self._last_mid,
+            "mqttv5_first_connect": self._mqttv5_first_connect,
+            "out_messages": out_messages,
+            "in_messages": in_messages,
+            "subscriptions": subscriptions,
+        }
+
+    def _save_session(self) -> None:
+        if self._session_store is None or self._client_id == b"":
+            return
+        if not self._session_persistence_enabled():
+            self._session_store.clear_session(self._client_id)
+            return
+        session_state = self._snapshot_session()
+        if not session_state["out_messages"] and not session_state["in_messages"] and not session_state["subscriptions"]:
+            self._session_store.clear_session(self._client_id)
+            return
+        self._session_store.save_session(self._client_id, session_state)
+
+    def _restore_session(self) -> None:
+        if not self._session_persistence_enabled() or self._session_store is None:
+            return
+        if self._out_messages or self._in_messages or self._subscriptions:
+            return
+        session_state = self._session_store.load_session(self._client_id)
+        if session_state is None:
+            return
+        with self._out_message_mutex:
+            self._out_messages = collections.OrderedDict(
+                (message_state["mid"], self._deserialize_message(message_state))
+                for message_state in session_state["out_messages"]
+            )
+        with self._in_message_mutex:
+            self._in_messages = collections.OrderedDict(
+                (message_state["mid"], self._deserialize_message(message_state))
+                for message_state in session_state["in_messages"]
+            )
+        with self._session_mutex:
+            self._subscriptions = collections.OrderedDict()
+            for subscription in session_state["subscriptions"]:
+                if subscription["options"] is None:
+                    self._subscriptions[subscription["topic"]] = subscription["qos"]
+                else:
+                    options = SubscribeOptions()
+                    options.unpack(subscription["options"])
+                    self._subscriptions[subscription["topic"]] = options
+        self._last_mid = session_state["last_mid"]
+        self._mqttv5_first_connect = session_state["mqttv5_first_connect"]
+
+    def _reset_session(self) -> None:
+        with self._out_message_mutex:
+            self._out_messages = collections.OrderedDict()
+            self._inflight_messages = 0
+        with self._in_message_mutex:
+            self._in_messages = collections.OrderedDict()
+        with self._session_mutex:
+            self._subscriptions = collections.OrderedDict()
+        self._out_packet.clear()
+        self._last_mid = 0
+        if self._session_store is not None and self._client_id != b"":
+            self._session_store.clear_session(self._client_id)
+
+    def _track_subscriptions(
+        self,
+        topic_qos_list: Sequence[tuple[bytes, int | SubscribeOptions]],
+    ) -> None:
+        with self._session_mutex:
+            for topic, subscription in topic_qos_list:
+                topic_name = topic.decode("utf-8")
+                self._subscriptions[topic_name] = subscription
+
+    def _forget_subscriptions(self, topic_list: Sequence[bytes]) -> None:
+        with self._session_mutex:
+            for topic in topic_list:
+                self._subscriptions.pop(topic.decode("utf-8"), None)
+
+    def _resubscribe_persistent_session(self) -> MQTTErrorCode:
+        with self._session_mutex:
+            if not self._subscriptions:
+                return MQTTErrorCode.MQTT_ERR_SUCCESS
+            if self._protocol == MQTTv5:
+                topic_qos_list = [
+                    (
+                        topic,
+                        subscription if isinstance(subscription, SubscribeOptions) else SubscribeOptions(qos=subscription),
+                    )
+                    for topic, subscription in self._subscriptions.items()
+                ]
+            else:
+                topic_qos_list = [
+                    (
+                        topic,
+                        subscription.QoS if isinstance(subscription, SubscribeOptions) else subscription,
+                    )
+                    for topic, subscription in self._subscriptions.items()
+                ]
+        result, _ = self.subscribe(topic_qos_list)
+        return result
 
     @property
     def host(self) -> str:
@@ -1580,6 +2034,16 @@ class Client:
             self._last_msg_in = time_func()
             self._last_msg_out = time_func()
 
+        if self._protocol == MQTTv5:
+            if self._check_clean_session():
+                self._reset_session()
+            else:
+                self._restore_session()
+        elif self._clean_session:
+            self._reset_session()
+        else:
+            self._restore_session()
+
         # Put messages in progress in a valid state.
         self._messages_reconnect_reset()
 
@@ -1804,17 +2268,17 @@ class Client:
                     rc = self._send_publish(message.mid, topic_bytes, message.payload, message.qos, message.retain,
                                             message.dup, message.info, message.properties)
 
-                    # remove from inflight messages so it will be send after a connection is made
                     if rc == MQTTErrorCode.MQTT_ERR_NO_CONN:
                         self._inflight_messages -= 1
                         message.state = mqtt_ms_publish
 
                     message.info.rc = rc
-                    return message.info
                 else:
                     message.state = mqtt_ms_queued
                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
-                    return message.info
+
+            self._save_session()
+            return message.info
 
     def username_pw_set(
         self, username: str | None, password: str | None = None
@@ -1883,6 +2347,7 @@ class Client:
         :param Properties properties: (MQTT v5.0 only) a Properties instance setting the MQTT v5.0 properties
             to be included. Optional - if not set, no properties are sent.
         """
+        self._save_session()
         if self._sock is None:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTED
             return MQTT_ERR_NO_CONN
@@ -2035,7 +2500,11 @@ class Client:
         if self._sock is None:
             return (MQTT_ERR_NO_CONN, None)
 
-        return self._send_subscribe(False, topic_qos_list, properties)
+        self._track_subscriptions(topic_qos_list)
+        result = self._send_subscribe(False, topic_qos_list, properties)
+        if result[0] == MQTTErrorCode.MQTT_ERR_SUCCESS:
+            self._save_session()
+        return result
 
     def unsubscribe(
         self, topic: str | list[str], properties: Properties | None = None
@@ -2077,7 +2546,11 @@ class Client:
         if self._sock is None:
             return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
 
-        return self._send_unsubscribe(False, topic_list, properties)
+        self._forget_subscriptions(topic_list)
+        result = self._send_unsubscribe(False, topic_list, properties)
+        if result[0] == MQTTErrorCode.MQTT_ERR_SUCCESS:
+            self._save_session()
+        return result
 
     def loop_read(self, max_packets: int = 1) -> MQTTErrorCode:
         """Process read network events. Use in place of calling `loop()` if you
@@ -3901,6 +4374,7 @@ class Client:
 
         # it won't be the first successful connect any more
         self._mqttv5_first_connect = False
+        session_present = (flags & 0x01) > 0
 
         with self._callback_mutex:
             on_connect = self.on_connect
@@ -4009,6 +4483,11 @@ class Client:
                                 return rc
                     self.loop_write()  # Process outgoing messages that have just been queued up
 
+            if not session_present and self._session_persistence_enabled():
+                resubscribe_rc = self._resubscribe_persistent_session()
+                if resubscribe_rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+                    return resubscribe_rc
+            self._save_session()
             return rc
         elif result > 0 and result < 6:
             return MQTTErrorCode.MQTT_ERR_CONN_REFUSED
@@ -4158,6 +4637,7 @@ class Client:
             with self._in_message_mutex:
                 self._in_messages[message.mid] = message
 
+            self._save_session()
             return rc
         else:
             return MQTTErrorCode.MQTT_ERR_PROTOCOL
@@ -4202,11 +4682,11 @@ class Client:
                         self._in_packet['packet'][3:])
         self._easy_log(MQTT_LOG_DEBUG, "Received PUBREL (Mid: %d)", mid)
 
+        session_changed = False
         with self._in_message_mutex:
             if mid in self._in_messages:
-                # Only pass the message on if we have removed it from the queue - this
-                # prevents multiple callbacks for the same message.
                 message = self._in_messages.pop(mid)
+                session_changed = True
                 self._handle_on_message(message)
                 self._inflight_messages -= 1
                 if self._max_inflight_messages > 0:
@@ -4214,6 +4694,9 @@ class Client:
                         rc = self._update_inflight()
                     if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                         return rc
+
+        if session_changed:
+            self._save_session()
 
         # FIXME: this should only be done if the message is known
         # If unknown it's a protocol error and we should close the connection.
@@ -4274,7 +4757,9 @@ class Client:
                 msg = self._out_messages[mid]
                 msg.state = mqtt_ms_wait_for_pubcomp
                 msg.timestamp = time_func()
-                return self._send_pubrel(mid)
+                rc = self._send_pubrel(mid)
+                self._save_session()
+                return rc
 
         return MQTTErrorCode.MQTT_ERR_SUCCESS
 
@@ -4432,6 +4917,7 @@ class Client:
                 rc = self._update_inflight()
                 if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                     return rc
+        self._save_session()
         return MQTTErrorCode.MQTT_ERR_SUCCESS
 
     def _handle_pubackcomp(

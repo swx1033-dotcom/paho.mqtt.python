@@ -1,0 +1,179 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index e990812..6f13e11 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -34,7 +34,9 @@ classifiers = [
+     "Topic :: Communications",
+     "Topic :: Internet",
+ ]
+-dependencies = []
++dependencies = [
++    "prometheus-client>=0.17.0"
++]
+ 
+ [project.optional-dependencies]
+ proxy = [
+diff --git a/src/paho/mqtt/client.py b/src/paho/mqtt/client.py
+index 4ccc869..72ac793 100644
+--- a/src/paho/mqtt/client.py
++++ b/src/paho/mqtt/client.py
+@@ -45,6 +45,17 @@ from .properties import Properties
+ from .reasoncodes import ReasonCode, ReasonCodes
+ from .subscribeoptions import SubscribeOptions
+ 
++try:
++    from .metrics import (
++        MQTT_MESSAGES_PUBLISHED,
++        MQTT_MESSAGES_RECEIVED,
++        MQTT_RECONNECTS,
++        MQTT_PUBLISH_LATENCY,
++        MQTT_CONNECTED,
++    )
++except ImportError:
++    pass
++
+ try:
+     from typing import Literal
+ except ImportError:
+@@ -1546,6 +1557,12 @@ class Client:
+     def reconnect(self) -> MQTTErrorCode:
+         """Reconnect the client after a disconnect. Can only be called after
+         connect()/connect_async()."""
++        try:
++            client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
++            MQTT_RECONNECTS.labels(client_id=client_id).inc()
++        except NameError:
++            pass
++
+         if len(self._host) == 0:
+             raise ValueError('Invalid host.')
+         if self._port <= 0:
+@@ -1774,6 +1791,12 @@ class Client:
+             rc = self._send_publish(
+                 local_mid, topic_bytes, local_payload, qos, retain, False, info, properties)
+             info.rc = rc
++            try:
++                client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
++                t_str = topic.decode('utf-8') if isinstance(topic, bytes) else topic
++                MQTT_MESSAGES_PUBLISHED.labels(client_id=client_id, topic=t_str, qos=qos).inc()
++            except NameError:
++                pass
+             return info
+         else:
+             message = MQTTMessage(local_mid, topic_bytes)
+@@ -1784,6 +1807,13 @@ class Client:
+             message.dup = False
+             message.properties = properties
+ 
++            try:
++                client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
++                t_str = topic.decode('utf-8') if isinstance(topic, bytes) else topic
++                MQTT_MESSAGES_PUBLISHED.labels(client_id=client_id, topic=t_str, qos=qos).inc()
++            except NameError:
++                pass
++
+             with self._out_message_mutex:
+                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
+                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
+@@ -3891,6 +3921,11 @@ class Client:
+         if result == 0:
+             self._state = _ConnectionState.MQTT_CS_CONNECTED
+             self._reconnect_delay = None
++            try:
++                client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
++                MQTT_CONNECTED.labels(client_id=client_id).set(1)
++            except NameError:
++                pass
+ 
+         if self._protocol == MQTTv5:
+             self._easy_log(
+@@ -4140,6 +4175,12 @@ class Client:
+                 print_topic, len(message.payload)
+             )
+ 
++        try:
++            client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
++            MQTT_MESSAGES_RECEIVED.labels(client_id=client_id, topic=print_topic, qos=message.qos).inc()
++        except NameError:
++            pass
++
+         message.timestamp = time_func()
+         if message.qos == 0:
+             self._handle_on_message(message)
+@@ -4349,6 +4390,12 @@ class Client:
+         reason: ReasonCode | None = None,
+         properties: Properties | None = None,
+     ) -> None:
++        try:
++            client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
++            MQTT_CONNECTED.labels(client_id=client_id).set(0)
++        except NameError:
++            pass
++
+         with self._callback_mutex:
+             on_disconnect = self.on_disconnect
+ 
+@@ -4425,6 +4472,15 @@ class Client:
+                         raise
+ 
+         msg = self._out_messages.pop(mid)
++        
++        try:
++            client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
++            t_str = msg.topic.decode('utf-8') if isinstance(msg.topic, bytes) else msg.topic
++            latency = time_func() - msg.timestamp
++            MQTT_PUBLISH_LATENCY.labels(client_id=client_id, topic=t_str, qos=msg.qos).observe(latency)
++        except NameError:
++            pass
++
+         msg.info._set_as_published()
+         if msg.qos > 0:
+             self._inflight_messages -= 1
+diff --git a/src/paho/mqtt/metrics.py b/src/paho/mqtt/metrics.py
+new file mode 100644
+index 0000000..b2133d9
+--- /dev/null
++++ b/src/paho/mqtt/metrics.py
+@@ -0,0 +1,42 @@
++"""
++Prometheus metrics for paho-mqtt client.
++"""
++
++from prometheus_client import Counter, Histogram, Gauge, start_http_server
++
++# Metric definitions
++MQTT_MESSAGES_PUBLISHED = Counter(
++    "mqtt_messages_published_total",
++    "Total number of MQTT messages published",
++    ["client_id", "topic", "qos"]
++)
++
++MQTT_MESSAGES_RECEIVED = Counter(
++    "mqtt_messages_received_total",
++    "Total number of MQTT messages received",
++    ["client_id", "topic", "qos"]
++)
++
++MQTT_RECONNECTS = Counter(
++    "mqtt_reconnects_total",
++    "Total number of MQTT reconnections",
++    ["client_id"]
++)
++
++MQTT_PUBLISH_LATENCY = Histogram(
++    "mqtt_publish_latency_seconds",
++    "Latency of MQTT message publish (from publish to PUBACK/PUBCOMP)",
++    ["client_id", "topic", "qos"]
++)
++
++MQTT_CONNECTED = Gauge(
++    "mqtt_connected_status",
++    "Current connection status of the MQTT client (1 = connected, 0 = disconnected)",
++    ["client_id"]
++)
++
++def start_metrics_server(port: int = 8000, addr: str = "0.0.0.0"):
++    """
++    Start the Prometheus metrics HTTP server.
++    """
++    start_http_server(port, addr)

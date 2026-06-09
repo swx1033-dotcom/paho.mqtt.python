@@ -46,6 +46,17 @@ from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
 
 try:
+    from .metrics import (
+        MQTT_MESSAGES_PUBLISHED,
+        MQTT_MESSAGES_RECEIVED,
+        MQTT_RECONNECTS,
+        MQTT_PUBLISH_LATENCY,
+        MQTT_CONNECTED,
+    )
+except ImportError:
+    pass
+
+try:
     from typing import Literal
 except ImportError:
     from typing_extensions import Literal  # type: ignore
@@ -1546,6 +1557,12 @@ class Client:
     def reconnect(self) -> MQTTErrorCode:
         """Reconnect the client after a disconnect. Can only be called after
         connect()/connect_async()."""
+        try:
+            client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
+            MQTT_RECONNECTS.labels(client_id=client_id).inc()
+        except NameError:
+            pass
+
         if len(self._host) == 0:
             raise ValueError('Invalid host.')
         if self._port <= 0:
@@ -1774,6 +1791,12 @@ class Client:
             rc = self._send_publish(
                 local_mid, topic_bytes, local_payload, qos, retain, False, info, properties)
             info.rc = rc
+            try:
+                client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
+                t_str = topic.decode('utf-8') if isinstance(topic, bytes) else topic
+                MQTT_MESSAGES_PUBLISHED.labels(client_id=client_id, topic=t_str, qos=qos).inc()
+            except NameError:
+                pass
             return info
         else:
             message = MQTTMessage(local_mid, topic_bytes)
@@ -1783,6 +1806,13 @@ class Client:
             message.retain = retain
             message.dup = False
             message.properties = properties
+
+            try:
+                client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
+                t_str = topic.decode('utf-8') if isinstance(topic, bytes) else topic
+                MQTT_MESSAGES_PUBLISHED.labels(client_id=client_id, topic=t_str, qos=qos).inc()
+            except NameError:
+                pass
 
             with self._out_message_mutex:
                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
@@ -3891,6 +3921,11 @@ class Client:
         if result == 0:
             self._state = _ConnectionState.MQTT_CS_CONNECTED
             self._reconnect_delay = None
+            try:
+                client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
+                MQTT_CONNECTED.labels(client_id=client_id).set(1)
+            except NameError:
+                pass
 
         if self._protocol == MQTTv5:
             self._easy_log(
@@ -4140,6 +4175,12 @@ class Client:
                 print_topic, len(message.payload)
             )
 
+        try:
+            client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
+            MQTT_MESSAGES_RECEIVED.labels(client_id=client_id, topic=print_topic, qos=message.qos).inc()
+        except NameError:
+            pass
+
         message.timestamp = time_func()
         if message.qos == 0:
             self._handle_on_message(message)
@@ -4349,6 +4390,12 @@ class Client:
         reason: ReasonCode | None = None,
         properties: Properties | None = None,
     ) -> None:
+        try:
+            client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
+            MQTT_CONNECTED.labels(client_id=client_id).set(0)
+        except NameError:
+            pass
+
         with self._callback_mutex:
             on_disconnect = self.on_disconnect
 
@@ -4425,6 +4472,15 @@ class Client:
                         raise
 
         msg = self._out_messages.pop(mid)
+        
+        try:
+            client_id = self._client_id.decode('utf-8') if isinstance(self._client_id, bytes) else self._client_id
+            t_str = msg.topic.decode('utf-8') if isinstance(msg.topic, bytes) else msg.topic
+            latency = time_func() - msg.timestamp
+            MQTT_PUBLISH_LATENCY.labels(client_id=client_id, topic=t_str, qos=msg.qos).observe(latency)
+        except NameError:
+            pass
+
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1

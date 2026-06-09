@@ -41,6 +41,7 @@ from paho.mqtt.packettypes import PacketTypes
 
 from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
 from .matcher import MQTTMatcher
+from .metrics import get_metrics
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
@@ -1551,6 +1552,9 @@ class Client:
         if self._port <= 0:
             raise ValueError('Invalid port number.')
 
+        metrics = get_metrics()
+        metrics.record_reconnection()
+
         self._in_packet = {
             "command": 0,
             "have_remaining": 0,
@@ -1769,11 +1773,16 @@ class Client:
 
         local_mid = self._mid_generate()
 
+        metrics = get_metrics()
+        metrics.record_message_published(topic, qos)
+
         if qos == 0:
             info = MQTTMessageInfo(local_mid)
             rc = self._send_publish(
                 local_mid, topic_bytes, local_payload, qos, retain, False, info, properties)
             info.rc = rc
+            if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+                metrics.record_message_publish_error(error_string(rc))
             return info
         else:
             message = MQTTMessage(local_mid, topic_bytes)
@@ -1787,15 +1796,18 @@ class Client:
             with self._out_message_mutex:
                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
+                    metrics.record_message_publish_error('queue_full')
                     return message.info
 
                 if local_mid in self._out_messages:
                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
+                    metrics.record_message_publish_error('duplicate_mid')
                     return message.info
 
                 self._out_messages[message.mid] = message
                 if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
                     self._inflight_messages += 1
+                    metrics.set_inflight_messages(self._inflight_messages)
                     if qos == 1:
                         message.state = mqtt_ms_wait_for_puback
                     elif qos == 2:
@@ -1807,13 +1819,16 @@ class Client:
                     # remove from inflight messages so it will be send after a connection is made
                     if rc == MQTTErrorCode.MQTT_ERR_NO_CONN:
                         self._inflight_messages -= 1
+                        metrics.set_inflight_messages(self._inflight_messages)
                         message.state = mqtt_ms_publish
+                        metrics.record_message_publish_error('no_connection')
 
                     message.info.rc = rc
                     return message.info
                 else:
                     message.state = mqtt_ms_queued
                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+                    metrics.set_queued_messages(len(self._out_messages) - self._inflight_messages)
                     return message.info
 
     def username_pw_set(
@@ -3891,6 +3906,9 @@ class Client:
         if result == 0:
             self._state = _ConnectionState.MQTT_CS_CONNECTED
             self._reconnect_delay = None
+            get_metrics().record_connection(success=True)
+        else:
+            get_metrics().record_connection(success=False)
 
         if self._protocol == MQTTv5:
             self._easy_log(
@@ -4030,6 +4048,9 @@ class Client:
                        properties
                        )
 
+        reason_str = reasonCode.getName() if reasonCode else 'unknown'
+        get_metrics().record_disconnection(reason=reason_str)
+
         self._sock_close()
         self._do_on_disconnect(
             packet_from_broker=True,
@@ -4052,6 +4073,12 @@ class Client:
             granted_qos = struct.unpack(pack_format, packet)
             reasoncodes = [ReasonCode(SUBACK >> 4, identifier=c) for c in granted_qos]
             properties = Properties(SUBACK >> 4)
+
+        metrics = get_metrics()
+        all_success = all(rc.isFailure == False for rc in reasoncodes)
+        metrics.record_subscription(success=all_success)
+        if all_success:
+            metrics.set_active_subscriptions(metrics.subscriptions_active._value.get() + len(reasoncodes))
 
         with self._callback_mutex:
             on_subscribe = self.on_subscribe
@@ -4124,6 +4151,9 @@ class Client:
             packet = packet[props_len:]
 
         message.payload = packet
+
+        metrics = get_metrics()
+        metrics.record_message_received(print_topic, message.qos, len(packet))
 
         if self._protocol == MQTTv5:
             self._easy_log(
@@ -4428,6 +4458,12 @@ class Client:
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1
+            metrics = get_metrics()
+            metrics.set_inflight_messages(self._inflight_messages)
+            metrics.record_message_acknowledged(msg.qos, 'puback' if msg.qos == 1 else 'pubcomp')
+            if msg.timestamp > 0:
+                latency = time_func() - msg.timestamp
+                metrics.record_publish_latency(msg.qos, latency)
             if self._max_inflight_messages > 0:
                 rc = self._update_inflight()
                 if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:

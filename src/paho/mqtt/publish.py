@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, List, Tuple, Union
 
 from paho.mqtt.enums import CallbackAPIVersion, MQTTProtocolVersion
+from paho.mqtt.metrics import get_metrics
 from paho.mqtt.properties import Properties
 from paho.mqtt.reasoncodes import ReasonCode
 

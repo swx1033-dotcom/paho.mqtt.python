@@ -34,7 +34,9 @@ classifiers = [
     "Topic :: Communications",
     "Topic :: Internet",
 ]
-dependencies = []
+dependencies = [
+    "prometheus-client>=0.17.0",
+]
 
 [project.optional-dependencies]
 proxy = [

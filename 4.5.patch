@@ -1,0 +1,765 @@
+diff --git a/examples/metrics_example.py b/examples/metrics_example.py
+new file mode 100644
+index 0000000..85021a7
+--- /dev/null
++++ b/examples/metrics_example.py
+@@ -0,0 +1,75 @@
++"""
++Example: MQTT client with Prometheus metrics monitoring.
++
++This example demonstrates how to use the paho-mqtt client with built-in
++Prometheus metrics collection and HTTP endpoint exposure.
++"""
++import time
++
++import paho.mqtt.client as mqtt
++from paho.mqtt.metrics import get_metrics, start_metrics_server
++
++
++def main():
++    # Start the Prometheus metrics server
++    metrics_server = start_metrics_server(host='0.0.0.0', port=9000)
++    print("Metrics server started at http://localhost:9000/metrics")
++
++    # Get the metrics instance (singleton)
++    metrics = get_metrics()
++
++    # Create MQTT client
++    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
++
++    # Define callbacks
++    def on_connect(client, userdata, flags, reason_code, properties):
++        print(f"Connected with result code {reason_code}")
++        if reason_code.isFailure:
++            print(f"Connection failed: {reason_code}")
++        else:
++            # Subscribe to a topic
++            client.subscribe("test/topic", qos=1)
++
++    def on_message(client, userdata, msg):
++        print(f"Received message on {msg.topic}: {msg.payload.decode()}")
++        # Metrics are automatically recorded
++
++    def on_publish(client, userdata, mid, reason_code, properties):
++        print(f"Message {mid} published")
++
++    def on_disconnect(client, userdata, flags, reason_code, properties):
++        print(f"Disconnected with result code {reason_code}")
++
++    # Register callbacks
++    client.on_connect = on_connect
++    client.on_message = on_message
++    client.on_publish = on_publish
++    client.on_disconnect = on_disconnect
++
++    # Connect to broker
++    client.connect("localhost", 1883, 60)
++
++    # Start loop in background
++    client.loop_start()
++
++    try:
++        # Publish some messages
++        for i in range(10):
++            topic = "test/topic"
++            payload = f"Message {i}"
++            client.publish(topic, payload, qos=1)
++            print(f"Published: {payload}")
++            time.sleep(1)
++
++        # Keep running to receive messages
++        while True:
++            time.sleep(1)
++    except KeyboardInterrupt:
++        print("\nShutting down...")
++        client.loop_stop()
++        client.disconnect()
++        metrics_server.stop()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/pyproject.toml b/pyproject.toml
+index e990812..31e1737 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -34,7 +34,9 @@ classifiers = [
+     "Topic :: Communications",
+     "Topic :: Internet",
+ ]
+-dependencies = []
++dependencies = [
++    "prometheus-client>=0.17.0",
++]
+ 
+ [project.optional-dependencies]
+ proxy = [
+diff --git a/src/paho/mqtt/client.py b/src/paho/mqtt/client.py
+index 4ccc869..4e114c5 100644
+--- a/src/paho/mqtt/client.py
++++ b/src/paho/mqtt/client.py
+@@ -41,6 +41,7 @@ from paho.mqtt.packettypes import PacketTypes
+ 
+ from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
+ from .matcher import MQTTMatcher
++from .metrics import get_metrics
+ from .properties import Properties
+ from .reasoncodes import ReasonCode, ReasonCodes
+ from .subscribeoptions import SubscribeOptions
+@@ -1551,6 +1552,9 @@ class Client:
+         if self._port <= 0:
+             raise ValueError('Invalid port number.')
+ 
++        metrics = get_metrics()
++        metrics.record_reconnection()
++
+         self._in_packet = {
+             "command": 0,
+             "have_remaining": 0,
+@@ -1769,11 +1773,16 @@ class Client:
+ 
+         local_mid = self._mid_generate()
+ 
++        metrics = get_metrics()
++        metrics.record_message_published(topic, qos)
++
+         if qos == 0:
+             info = MQTTMessageInfo(local_mid)
+             rc = self._send_publish(
+                 local_mid, topic_bytes, local_payload, qos, retain, False, info, properties)
+             info.rc = rc
++            if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
++                metrics.record_message_publish_error(error_string(rc))
+             return info
+         else:
+             message = MQTTMessage(local_mid, topic_bytes)
+@@ -1787,15 +1796,18 @@ class Client:
+             with self._out_message_mutex:
+                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
+                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
++                    metrics.record_message_publish_error('queue_full')
+                     return message.info
+ 
+                 if local_mid in self._out_messages:
+                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
++                    metrics.record_message_publish_error('duplicate_mid')
+                     return message.info
+ 
+                 self._out_messages[message.mid] = message
+                 if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
+                     self._inflight_messages += 1
++                    metrics.set_inflight_messages(self._inflight_messages)
+                     if qos == 1:
+                         message.state = mqtt_ms_wait_for_puback
+                     elif qos == 2:
+@@ -1807,13 +1819,16 @@ class Client:
+                     # remove from inflight messages so it will be send after a connection is made
+                     if rc == MQTTErrorCode.MQTT_ERR_NO_CONN:
+                         self._inflight_messages -= 1
++                        metrics.set_inflight_messages(self._inflight_messages)
+                         message.state = mqtt_ms_publish
++                        metrics.record_message_publish_error('no_connection')
+ 
+                     message.info.rc = rc
+                     return message.info
+                 else:
+                     message.state = mqtt_ms_queued
+                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
++                    metrics.set_queued_messages(len(self._out_messages) - self._inflight_messages)
+                     return message.info
+ 
+     def username_pw_set(
+@@ -3891,6 +3906,9 @@ class Client:
+         if result == 0:
+             self._state = _ConnectionState.MQTT_CS_CONNECTED
+             self._reconnect_delay = None
++            get_metrics().record_connection(success=True)
++        else:
++            get_metrics().record_connection(success=False)
+ 
+         if self._protocol == MQTTv5:
+             self._easy_log(
+@@ -4030,6 +4048,9 @@ class Client:
+                        properties
+                        )
+ 
++        reason_str = reasonCode.getName() if reasonCode else 'unknown'
++        get_metrics().record_disconnection(reason=reason_str)
++
+         self._sock_close()
+         self._do_on_disconnect(
+             packet_from_broker=True,
+@@ -4053,6 +4074,12 @@ class Client:
+             reasoncodes = [ReasonCode(SUBACK >> 4, identifier=c) for c in granted_qos]
+             properties = Properties(SUBACK >> 4)
+ 
++        metrics = get_metrics()
++        all_success = all(rc.isFailure == False for rc in reasoncodes)
++        metrics.record_subscription(success=all_success)
++        if all_success:
++            metrics.set_active_subscriptions(metrics.subscriptions_active._value.get() + len(reasoncodes))
++
+         with self._callback_mutex:
+             on_subscribe = self.on_subscribe
+ 
+@@ -4125,6 +4152,9 @@ class Client:
+ 
+         message.payload = packet
+ 
++        metrics = get_metrics()
++        metrics.record_message_received(print_topic, message.qos, len(packet))
++
+         if self._protocol == MQTTv5:
+             self._easy_log(
+                 MQTT_LOG_DEBUG,
+@@ -4428,6 +4458,12 @@ class Client:
+         msg.info._set_as_published()
+         if msg.qos > 0:
+             self._inflight_messages -= 1
++            metrics = get_metrics()
++            metrics.set_inflight_messages(self._inflight_messages)
++            metrics.record_message_acknowledged(msg.qos, 'puback' if msg.qos == 1 else 'pubcomp')
++            if msg.timestamp > 0:
++                latency = time_func() - msg.timestamp
++                metrics.record_publish_latency(msg.qos, latency)
+             if self._max_inflight_messages > 0:
+                 rc = self._update_inflight()
+                 if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+diff --git a/src/paho/mqtt/metrics.py b/src/paho/mqtt/metrics.py
+new file mode 100644
+index 0000000..42a2a43
+--- /dev/null
++++ b/src/paho/mqtt/metrics.py
+@@ -0,0 +1,201 @@
++"""
++Prometheus metrics collection for paho-mqtt client.
++
++This module provides Prometheus metrics for monitoring MQTT client operations,
++including message throughput, reconnection counts, message latency, and more.
++"""
++from __future__ import annotations
++
++import threading
++from typing import TYPE_CHECKING
++
++from prometheus_client import Counter, Gauge, Histogram
++
++if TYPE_CHECKING:
++    from typing import Optional
++
++
++class MQTTMetrics:
++    """Prometheus metrics collector for MQTT client operations."""
++
++    _instance = None
++    _lock = threading.Lock()
++
++    def __new__(cls) -> MQTTMetrics:
++        if cls._instance is None:
++            with cls._lock:
++                if cls._instance is None:
++                    cls._instance = super().__new__(cls)
++                    cls._instance._initialized = False
++        return cls._instance
++
++    def __init__(self) -> None:
++        if self._initialized:
++            return
++
++        self._initialized = True
++        self._setup_metrics()
++
++    def _setup_metrics(self) -> None:
++        # Connection metrics
++        self.connections_total = Counter(
++            'mqtt_connections_total',
++            'Total number of MQTT connections',
++            ['status']  # success, failed
++        )
++
++        self.reconnections_total = Counter(
++            'mqtt_reconnections_total',
++            'Total number of MQTT reconnection attempts'
++        )
++
++        self.connection_duration_seconds = Histogram(
++            'mqtt_connection_duration_seconds',
++            'Duration of MQTT connections',
++            buckets=(60, 300, 600, 1800, 3600, 7200, 14400, 28800, 86400, float('inf'))
++        )
++
++        # Message publish metrics
++        self.messages_published_total = Counter(
++            'mqtt_messages_published_total',
++            'Total number of messages published',
++            ['qos', 'topic']
++        )
++
++        self.messages_publish_errors_total = Counter(
++            'mqtt_messages_publish_errors_total',
++            'Total number of message publish errors',
++            ['error_type']
++        )
++
++        self.publish_latency_seconds = Histogram(
++            'mqtt_publish_latency_seconds',
++            'Latency for message publishing (from publish to ack)',
++            ['qos'],
++            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, float('inf'))
++        )
++
++        # Message receive metrics
++        self.messages_received_total = Counter(
++            'mqtt_messages_received_total',
++            'Total number of messages received',
++            ['qos', 'topic']
++        )
++
++        self.messages_received_bytes = Counter(
++            'mqtt_messages_received_bytes_total',
++            'Total bytes of messages received',
++            ['topic']
++        )
++
++        # Message acknowledgment metrics
++        self.messages_acknowledged_total = Counter(
++            'mqtt_messages_acknowledged_total',
++            'Total number of messages acknowledged',
++            ['qos', 'ack_type']  # puback, pubrec, pubrel, pubcomp
++        )
++
++        # Queue metrics
++        self.messages_inflight = Gauge(
++            'mqtt_messages_inflight',
++            'Current number of inflight messages'
++        )
++
++        self.messages_queued = Gauge(
++            'mqtt_messages_queued',
++            'Current number of queued messages'
++        )
++
++        # Network metrics
++        self.bytes_sent_total = Counter(
++            'mqtt_bytes_sent_total',
++            'Total bytes sent over MQTT connection'
++        )
++
++        self.bytes_received_total = Counter(
++            'mqtt_bytes_received_total',
++            'Total bytes received over MQTT connection'
++        )
++
++        # Disconnection metrics
++        self.disconnections_total = Counter(
++            'mqtt_disconnections_total',
++            'Total number of disconnections',
++            ['reason']
++        )
++
++        # Subscription metrics
++        self.subscriptions_total = Counter(
++            'mqtt_subscriptions_total',
++            'Total number of subscriptions',
++            ['status']  # success, failed
++        )
++
++        self.subscriptions_active = Gauge(
++            'mqtt_subscriptions_active',
++            'Current number of active subscriptions'
++        )
++
++    def record_connection(self, success: bool) -> None:
++        """Record a connection attempt."""
++        status = 'success' if success else 'failed'
++        self.connections_total.labels(status=status).inc()
++
++    def record_reconnection(self) -> None:
++        """Record a reconnection attempt."""
++        self.reconnections_total.inc()
++
++    def record_message_published(self, topic: str, qos: int) -> None:
++        """Record a message publish."""
++        self.messages_published_total.labels(qos=str(qos), topic=topic).inc()
++
++    def record_message_publish_error(self, error_type: str) -> None:
++        """Record a message publish error."""
++        self.messages_publish_errors_total.labels(error_type=error_type).inc()
++
++    def record_publish_latency(self, qos: int, latency: float) -> None:
++        """Record message publish latency."""
++        self.publish_latency_seconds.labels(qos=str(qos)).observe(latency)
++
++    def record_message_received(self, topic: str, qos: int, payload_size: int) -> None:
++        """Record a message receive."""
++        self.messages_received_total.labels(qos=str(qos), topic=topic).inc()
++        self.messages_received_bytes.labels(topic=topic).inc(payload_size)
++
++    def record_message_acknowledged(self, qos: int, ack_type: str) -> None:
++        """Record a message acknowledgment."""
++        self.messages_acknowledged_total.labels(qos=str(qos), ack_type=ack_type).inc()
++
++    def set_inflight_messages(self, count: int) -> None:
++        """Set the current number of inflight messages."""
++        self.messages_inflight.set(count)
++
++    def set_queued_messages(self, count: int) -> None:
++        """Set the current number of queued messages."""
++        self.messages_queued.set(count)
++
++    def record_bytes_sent(self, byte_count: int) -> None:
++        """Record bytes sent."""
++        self.bytes_sent_total.inc(byte_count)
++
++    def record_bytes_received(self, byte_count: int) -> None:
++        """Record bytes received."""
++        self.bytes_received_total.inc(byte_count)
++
++    def record_disconnection(self, reason: str) -> None:
++        """Record a disconnection."""
++        self.disconnections_total.labels(reason=reason).inc()
++
++    def record_subscription(self, success: bool) -> None:
++        """Record a subscription attempt."""
++        status = 'success' if success else 'failed'
++        self.subscriptions_total.labels(status=status).inc()
++
++    def set_active_subscriptions(self, count: int) -> None:
++        """Set the current number of active subscriptions."""
++        self.subscriptions_active.set(count)
++
++
++def get_metrics() -> MQTTMetrics:
++    """Get the singleton MQTTMetrics instance."""
++    return MQTTMetrics()
+diff --git a/src/paho/mqtt/metrics_server.py b/src/paho/mqtt/metrics_server.py
+new file mode 100644
+index 0000000..d59850b
+--- /dev/null
++++ b/src/paho/mqtt/metrics_server.py
+@@ -0,0 +1,100 @@
++"""
++HTTP server for exposing MQTT Prometheus metrics.
++
++This module provides a simple HTTP server that exposes MQTT client metrics
++in Prometheus format for scraping.
++"""
++from __future__ import annotations
++
++import threading
++from http.server import HTTPServer, BaseHTTPRequestHandler
++from typing import TYPE_CHECKING
++
++from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, REGISTRY
++
++if TYPE_CHECKING:
++    from typing import Optional
++
++
++class MetricsHTTPHandler(BaseHTTPRequestHandler):
++    """HTTP request handler for Prometheus metrics endpoint."""
++
++    def do_GET(self) -> None:
++        if self.path == '/metrics':
++            metrics_data = generate_latest(REGISTRY)
++            self.send_response(200)
++            self.send_header('Content-Type', CONTENT_TYPE_LATEST)
++            self.send_header('Content-Length', str(len(metrics_data)))
++            self.end_headers()
++            self.wfile.write(metrics_data)
++        elif self.path == '/health':
++            self.send_response(200)
++            self.send_header('Content-Type', 'text/plain')
++            self.end_headers()
++            self.wfile.write(b'OK')
++        else:
++            self.send_response(404)
++            self.end_headers()
++
++    def log_message(self, format: str, *args) -> None:
++        """Suppress default logging."""
++        pass
++
++
++class MetricsServer:
++    """HTTP server for exposing MQTT metrics to Prometheus."""
++
++    def __init__(self, host: str = '0.0.0.0', port: int = 9000) -> None:
++        self.host = host
++        self.port = port
++        self._server: Optional[HTTPServer] = None
++        self._thread: Optional[threading.Thread] = None
++
++    def start(self) -> None:
++        """Start the metrics HTTP server in a background thread."""
++        self._server = HTTPServer((self.host, self.port), MetricsHTTPHandler)
++        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
++        self._thread.start()
++
++    def stop(self) -> None:
++        """Stop the metrics HTTP server."""
++        if self._server:
++            self._server.shutdown()
++            self._server = None
++        if self._thread:
++            self._thread.join(timeout=5)
++            self._thread = None
++
++    def is_running(self) -> bool:
++        """Check if the server is running."""
++        return self._server is not None and self._thread is not None
++
++
++_metrics_server: MetricsServer | None = None
++
++
++def start_metrics_server(host: str = '0.0.0.0', port: int = 9000) -> MetricsServer:
++    """Start the global metrics server.
++    
++    :param host: Host to bind the server to
++    :param port: Port to bind the server to
++    :returns: The MetricsServer instance
++    """
++    global _metrics_server
++    if _metrics_server is None or not _metrics_server.is_running():
++        _metrics_server = MetricsServer(host=host, port=port)
++        _metrics_server.start()
++    return _metrics_server
++
++
++def stop_metrics_server() -> None:
++    """Stop the global metrics server."""
++    global _metrics_server
++    if _metrics_server:
++        _metrics_server.stop()
++        _metrics_server = None
++
++
++def get_metrics_server() -> MetricsServer | None:
++    """Get the current metrics server instance."""
++    return _metrics_server
+diff --git a/src/paho/mqtt/publish.py b/src/paho/mqtt/publish.py
+index 333c190..e3a8500 100644
+--- a/src/paho/mqtt/publish.py
++++ b/src/paho/mqtt/publish.py
+@@ -25,6 +25,7 @@ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, Any, List, Tuple, Union
+ 
+ from paho.mqtt.enums import CallbackAPIVersion, MQTTProtocolVersion
++from paho.mqtt.metrics import get_metrics
+ from paho.mqtt.properties import Properties
+ from paho.mqtt.reasoncodes import ReasonCode
+ 
+diff --git a/tests/test_metrics.py b/tests/test_metrics.py
+new file mode 100644
+index 0000000..dd6e789
+--- /dev/null
++++ b/tests/test_metrics.py
+@@ -0,0 +1,207 @@
++"""Tests for MQTT Prometheus metrics collection."""
++import unittest
++from prometheus_client import REGISTRY
++from paho.mqtt.metrics import MQTTMetrics, get_metrics
++
++
++class TestMQTTMetrics(unittest.TestCase):
++    """Test cases for MQTT metrics collection."""
++
++    def setUp(self):
++        """Set up test fixtures."""
++        self.metrics = get_metrics()
++
++    def test_singleton_pattern(self):
++        """Test that MQTTMetrics follows singleton pattern."""
++        metrics1 = MQTTMetrics()
++        metrics2 = MQTTMetrics()
++        self.assertIs(metrics1, metrics2)
++
++    def test_get_metrics_returns_singleton(self):
++        """Test that get_metrics returns the singleton instance."""
++        metrics1 = get_metrics()
++        metrics2 = get_metrics()
++        self.assertIs(metrics1, metrics2)
++
++    def test_record_connection_success(self):
++        """Test recording successful connection."""
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_connections_total', {'status': 'success'}
++        ) or 0
++        self.metrics.record_connection(success=True)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_connections_total', {'status': 'success'}
++        )
++        self.assertEqual(new_count, initial_count + 1)
++
++    def test_record_connection_failure(self):
++        """Test recording failed connection."""
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_connections_total', {'status': 'failed'}
++        ) or 0
++        self.metrics.record_connection(success=False)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_connections_total', {'status': 'failed'}
++        )
++        self.assertEqual(new_count, initial_count + 1)
++
++    def test_record_reconnection(self):
++        """Test recording reconnection."""
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_reconnections_total'
++        ) or 0
++        self.metrics.record_reconnection()
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_reconnections_total'
++        )
++        self.assertEqual(new_count, initial_count + 1)
++
++    def test_record_message_published(self):
++        """Test recording message publish."""
++        topic = "test/topic"
++        qos = 1
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_messages_published_total', {'qos': str(qos), 'topic': topic}
++        ) or 0
++        self.metrics.record_message_published(topic, qos)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_messages_published_total', {'qos': str(qos), 'topic': topic}
++        )
++        self.assertEqual(new_count, initial_count + 1)
++
++    def test_record_message_publish_error(self):
++        """Test recording message publish error."""
++        error_type = "no_connection"
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_messages_publish_errors_total', {'error_type': error_type}
++        ) or 0
++        self.metrics.record_message_publish_error(error_type)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_messages_publish_errors_total', {'error_type': error_type}
++        )
++        self.assertEqual(new_count, initial_count + 1)
++
++    def test_record_message_received(self):
++        """Test recording message receive."""
++        topic = "test/topic"
++        qos = 1
++        payload_size = 100
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_messages_received_total', {'qos': str(qos), 'topic': topic}
++        ) or 0
++        initial_bytes = REGISTRY.get_sample_value(
++            'mqtt_messages_received_bytes_total', {'topic': topic}
++        ) or 0
++        self.metrics.record_message_received(topic, qos, payload_size)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_messages_received_total', {'qos': str(qos), 'topic': topic}
++        )
++        new_bytes = REGISTRY.get_sample_value(
++            'mqtt_messages_received_bytes_total', {'topic': topic}
++        )
++        self.assertEqual(new_count, initial_count + 1)
++        self.assertEqual(new_bytes, initial_bytes + payload_size)
++
++    def test_record_message_acknowledged(self):
++        """Test recording message acknowledgment."""
++        qos = 1
++        ack_type = "puback"
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_messages_acknowledged_total', {'qos': str(qos), 'ack_type': ack_type}
++        ) or 0
++        self.metrics.record_message_acknowledged(qos, ack_type)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_messages_acknowledged_total', {'qos': str(qos), 'ack_type': ack_type}
++        )
++        self.assertEqual(new_count, initial_count + 1)
++
++    def test_set_inflight_messages(self):
++        """Test setting inflight messages gauge."""
++        count = 5
++        self.metrics.set_inflight_messages(count)
++        value = REGISTRY.get_sample_value('mqtt_messages_inflight')
++        self.assertEqual(value, count)
++
++    def test_set_queued_messages(self):
++        """Test setting queued messages gauge."""
++        count = 10
++        self.metrics.set_queued_messages(count)
++        value = REGISTRY.get_sample_value('mqtt_messages_queued')
++        self.assertEqual(value, count)
++
++    def test_record_bytes_sent(self):
++        """Test recording bytes sent."""
++        byte_count = 1024
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_bytes_sent_total'
++        ) or 0
++        self.metrics.record_bytes_sent(byte_count)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_bytes_sent_total'
++        )
++        self.assertEqual(new_count, initial_count + byte_count)
++
++    def test_record_bytes_received(self):
++        """Test recording bytes received."""
++        byte_count = 2048
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_bytes_received_total'
++        ) or 0
++        self.metrics.record_bytes_received(byte_count)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_bytes_received_total'
++        )
++        self.assertEqual(new_count, initial_count + byte_count)
++
++    def test_record_disconnection(self):
++        """Test recording disconnection."""
++        reason = "Normal disconnection"
++        initial_count = REGISTRY.get_sample_value(
++            'mqtt_disconnections_total', {'reason': reason}
++        ) or 0
++        self.metrics.record_disconnection(reason=reason)
++        new_count = REGISTRY.get_sample_value(
++            'mqtt_disconnections_total', {'reason': reason}
++        )
++        self.assertEqual(new_count, initial_count + 1)
++
++    def test_record_subscription(self):
++        """Test recording subscription."""
++        initial_success = REGISTRY.get_sample_value(
++            'mqtt_subscriptions_total', {'status': 'success'}
++        ) or 0
++        initial_failed = REGISTRY.get_sample_value(
++            'mqtt_subscriptions_total', {'status': 'failed'}
++        ) or 0
++        self.metrics.record_subscription(success=True)
++        self.metrics.record_subscription(success=False)
++        new_success = REGISTRY.get_sample_value(
++            'mqtt_subscriptions_total', {'status': 'success'}
++        )
++        new_failed = REGISTRY.get_sample_value(
++            'mqtt_subscriptions_total', {'status': 'failed'}
++        )
++        self.assertEqual(new_success, initial_success + 1)
++        self.assertEqual(new_failed, initial_failed + 1)
++
++    def test_set_active_subscriptions(self):
++        """Test setting active subscriptions gauge."""
++        count = 3
++        self.metrics.set_active_subscriptions(count)
++        value = REGISTRY.get_sample_value('mqtt_subscriptions_active')
++        self.assertEqual(value, count)
++
++    def test_record_publish_latency(self):
++        """Test recording publish latency."""
++        qos = 1
++        latency = 0.5
++        self.metrics.record_publish_latency(qos, latency)
++        count = REGISTRY.get_sample_value(
++            'mqtt_publish_latency_seconds_count', {'qos': str(qos)}
++        )
++        self.assertIsNotNone(count)
++        self.assertGreater(count, 0)
++
++
++if __name__ == '__main__':
++    unittest.main()

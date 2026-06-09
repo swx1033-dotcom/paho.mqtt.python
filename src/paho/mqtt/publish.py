@@ -115,6 +115,10 @@ def multiple(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    prometheus_namespace: str | None = None,
+    prometheus_registry: Any | None = None,
+    prometheus_http_port: int | None = None,
+    prometheus_http_addr: str = "127.0.0.1",
 ) -> None:
     """Publish multiple messages to a broker, then disconnect cleanly.
 
@@ -196,6 +200,14 @@ def multiple(
     client.on_publish = _on_publish
     client.on_connect = _on_connect  # type: ignore
 
+    if prometheus_namespace is not None or prometheus_registry is not None or prometheus_http_port is not None:
+        client.enable_prometheus_metrics(
+            namespace=prometheus_namespace or "paho_mqtt",
+            registry=prometheus_registry,
+        )
+        if prometheus_http_port is not None:
+            client.start_prometheus_http_server(prometheus_http_port, prometheus_http_addr)
+
     if proxy_args is not None:
         client.proxy_set(**proxy_args)
 
@@ -243,6 +255,10 @@ def single(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    prometheus_namespace: str | None = None,
+    prometheus_registry: Any | None = None,
+    prometheus_http_port: int | None = None,
+    prometheus_http_addr: str = "127.0.0.1",
 ) -> None:
     """Publish a single message to a broker, then disconnect cleanly.
 
@@ -302,5 +318,20 @@ def single(
 
     msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
 
-    multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
-             protocol, transport, proxy_args)
+    multiple(
+        [msg],
+        hostname,
+        port,
+        client_id,
+        keepalive,
+        will,
+        auth,
+        tls,
+        protocol,
+        transport,
+        proxy_args,
+        prometheus_namespace,
+        prometheus_registry,
+        prometheus_http_port,
+        prometheus_http_addr,
+    )

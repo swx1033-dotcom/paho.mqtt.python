@@ -54,6 +54,16 @@ class MQTTMatcher:
                      break
                 del parent._children[k]
 
+    def items(self):
+        """Return an iterator over all (key, value) pairs in the trie."""
+        def _items(node, path):
+            if node._content is not None:
+                yield (path, node._content)
+            for sym, child in node._children.items():
+                new_path = path + '/' + sym if path else sym
+                yield from _items(child, new_path)
+        return _items(self._root, '')
+
     def iter_match(self, topic):
         """Return an iterator on all values associated with filters
         that match the :topic"""

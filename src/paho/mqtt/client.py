@@ -41,6 +41,7 @@ from paho.mqtt.packettypes import PacketTypes
 
 from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
 from .matcher import MQTTMatcher
+from .persistence import NullSessionPersistence, SessionPersistence
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
@@ -740,6 +741,7 @@ class Client:
         transport: Literal["tcp", "websockets", "unix"] = "tcp",
         reconnect_on_failure: bool = True,
         manual_ack: bool = False,
+        session_persistence: SessionPersistence | None = None,
     ) -> None:
         transport = transport.lower()  # type: ignore
         if transport == "unix" and not hasattr(socket, "AF_UNIX"):
@@ -796,6 +798,8 @@ class Client:
                 self._client_id = b""
         else:
             self._client_id = _force_bytes(client_id)
+
+        self._session_persistence = session_persistence if session_persistence is not None else NullSessionPersistence()
 
         self._username: bytes | None = None
         self._password: bytes | None = None
@@ -878,6 +882,87 @@ class Client:
 
     def __del__(self) -> None:
         self._reset_sockets()
+        self._session_persistence.close()
+
+    @property
+    def session_persistence(self) -> SessionPersistence:
+        """The session persistence backend in use.
+
+        Returns the `SessionPersistence` instance currently associated
+        with this client. This property is read-only.
+        """
+        return self._session_persistence
+
+    def _restore_session_state(self) -> None:
+        """Restore session state from the persistence store into memory."""
+        client_id = self._client_id.decode('utf-8')
+        if not client_id:
+            return
+        self._session_persistence.open(client_id)
+        last_mid, out_msgs, in_msgs, _ = self._session_persistence.load_session_state()
+
+        if last_mid > self._last_mid:
+            self._last_mid = last_mid
+
+        with self._out_message_mutex:
+            for mid, data in out_msgs.items():
+                message = MQTTMessage()
+                message.timestamp = data['timestamp']
+                message.state = data['state']
+                message.dup = data['dup']
+                message._topic = data['topic'].encode('utf-8')
+                message.payload = data['payload']
+                message.qos = data['qos']
+                message.retain = data['retain']
+                message.mid = data['mid']
+                self._out_messages[mid] = message
+
+        with self._in_message_mutex:
+            for mid, data in in_msgs.items():
+                message = MQTTMessage()
+                message.timestamp = data['timestamp']
+                message.state = data['state']
+                message.dup = data['dup']
+                message._topic = data['topic'].encode('utf-8')
+                message.payload = data['payload']
+                message.qos = data['qos']
+                message.retain = data['retain']
+                message.mid = data['mid']
+                self._in_messages[mid] = message
+
+    def _persist_session_state(self) -> None:
+        """Persist current session state from memory to the persistence store."""
+        client_id = self._client_id.decode('utf-8')
+        if not client_id:
+            return
+        self._session_persistence.open(client_id)
+
+        subscriptions: list = []
+        with self._callback_mutex:
+            for topic, callback in self._on_message_filtered.items():
+                try:
+                    if callback is not None:
+                        subscriptions.append((topic, callback))
+                except Exception:
+                    continue
+
+        with self._out_message_mutex:
+            out_msgs = dict(self._out_messages)
+        with self._in_message_mutex:
+            in_msgs = dict(self._in_messages)
+
+        self._session_persistence.save_session_state(
+            self._last_mid,
+            out_msgs,
+            in_msgs,
+            subscriptions,
+        )
+
+    def _clear_persisted_session(self) -> None:
+        """Clear all persisted session state."""
+        client_id = self._client_id.decode('utf-8')
+        self._session_persistence.open(client_id)
+        self._session_persistence.clear_session_state()
 
     @property
     def host(self) -> str:
@@ -1432,6 +1517,10 @@ class Client:
 
         self.connect_async(host, port, keepalive,
                            bind_address, bind_port, clean_start, properties)
+
+        if not self._check_clean_session():
+            self._restore_session_state()
+
         return self.reconnect()
 
     def connect_srv(
@@ -1567,8 +1656,11 @@ class Client:
 
         self._sock_close()
 
+        # Persist current session state before reconnect resets messages
+        if not self._check_clean_session():
+            self._persist_session_state()
+
         # Mark all currently outgoing QoS = 0 packets as lost,
-        # or `wait_for_publish()` could hang forever
         for pkt in self._out_packet:
             if pkt["command"] & 0xF0 == PUBLISH and pkt["qos"] == 0 and pkt["info"] is not None:
                 pkt["info"].rc = MQTT_ERR_CONN_LOST
@@ -1582,6 +1674,10 @@ class Client:
 
         # Put messages in progress in a valid state.
         self._messages_reconnect_reset()
+
+        # Re-persist after message state reset to save updated retry states
+        if not self._check_clean_session():
+            self._persist_session_state()
 
         with self._callback_mutex:
             on_pre_connect = self.on_pre_connect
@@ -1883,6 +1979,9 @@ class Client:
         :param Properties properties: (MQTT v5.0 only) a Properties instance setting the MQTT v5.0 properties
             to be included. Optional - if not set, no properties are sent.
         """
+        if not self._check_clean_session():
+            self._persist_session_state()
+
         if self._sock is None:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTED
             return MQTT_ERR_NO_CONN
@@ -3742,6 +3841,7 @@ class Client:
         with self._in_message_mutex:
             if self._check_clean_session():
                 self._in_messages = collections.OrderedDict()
+                self._clear_persisted_session()
                 return
             for m in self._in_messages.values():
                 m.timestamp = 0

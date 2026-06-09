@@ -825,6 +825,8 @@ class Client:
         self._in_messages: collections.OrderedDict[
             int, MQTTMessage
         ] = collections.OrderedDict()
+        self._subscriptions: list[tuple[str, int]] = []
+        self._persistence = None
         self._max_inflight_messages = 20
         self._inflight_messages = 0
         self._max_queued_messages = 0
@@ -1145,12 +1147,17 @@ class Client:
             self._sockpairW.close()
             self._sockpairW = None
 
+    def persistence_set(self, persistence) -> None:
+        """Set a persistence object that will save/restore the session state."""
+        self._persistence = persistence
+
     def reinitialise(
         self,
         client_id: str = "",
         clean_session: bool = True,
         userdata: Any = None,
     ) -> None:
+        self._reset_session()
         self._reset_sockets()
 
         self.__init__(client_id, clean_session, userdata)  # type: ignore[misc]
@@ -1582,6 +1589,8 @@ class Client:
 
         # Put messages in progress in a valid state.
         self._messages_reconnect_reset()
+        
+        self._load_session()
 
         with self._callback_mutex:
             on_pre_connect = self.on_pre_connect
@@ -1885,11 +1894,14 @@ class Client:
         """
         if self._sock is None:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTED
+            self._save_session()
             return MQTT_ERR_NO_CONN
         else:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTING
 
-        return self._send_disconnect(reasoncode, properties)
+        rc = self._send_disconnect(reasoncode, properties)
+        self._save_session()
+        return rc
 
     def subscribe(
         self,
@@ -2032,6 +2044,17 @@ class Client:
         if any(self._filter_wildcard_len_check(topic) != MQTT_ERR_SUCCESS for topic, _ in topic_qos_list):
             raise ValueError('Invalid subscription filter.')
 
+        for topic, qos_or_opt in topic_qos_list:
+            if isinstance(qos_or_opt, int):
+                qos = qos_or_opt
+            else:
+                qos = qos_or_opt.qos
+            t_str = topic.decode('utf-8')
+            # remove existing if present
+            self._subscriptions = [(t, q) for t, q in self._subscriptions if t != t_str]
+            self._subscriptions.append((t_str, qos))
+        self._save_session()
+
         if self._sock is None:
             return (MQTT_ERR_NO_CONN, None)
 
@@ -2073,6 +2096,11 @@ class Client:
 
         if topic_list is None:
             raise ValueError("No topic specified, or incorrect topic type.")
+
+        for t in topic_list:
+            t_str = t.decode('utf-8')
+            self._subscriptions = [(sub_t, sub_q) for sub_t, sub_q in self._subscriptions if sub_t != t_str]
+        self._save_session()
 
         if self._sock is None:
             return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
@@ -3708,6 +3736,32 @@ class Client:
                 return self._clean_start  # type: ignore
         else:
             return self._clean_session
+
+    def _load_session(self) -> None:
+        if self._persistence and self._client_id:
+            out_msgs, in_msgs, subs = self._persistence.load_session(self._client_id.decode('utf-8'))
+            self._out_messages.clear()
+            self._in_messages.clear()
+            self._subscriptions.clear()
+            self._out_messages.update(out_msgs)
+            self._in_messages.update(in_msgs)
+            self._subscriptions.extend(subs)
+
+    def _save_session(self) -> None:
+        if self._persistence and self._client_id:
+            self._persistence.save_session(
+                self._client_id.decode('utf-8'),
+                self._out_messages,
+                self._in_messages,
+                self._subscriptions
+            )
+
+    def _reset_session(self) -> None:
+        self._out_messages.clear()
+        self._in_messages.clear()
+        self._subscriptions.clear()
+        if self._persistence and self._client_id:
+            self._persistence.clear_session(self._client_id.decode('utf-8'))
 
     def _messages_reconnect_reset_out(self) -> None:
         with self._out_message_mutex:

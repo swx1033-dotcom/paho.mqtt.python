@@ -115,12 +115,16 @@ def multiple(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    metrics_port: int | None = None,
 ) -> None:
     """Publish multiple messages to a broker, then disconnect cleanly.
 
     This function creates an MQTT client, connects to a broker and publishes a
     list of messages. Once the messages have been delivered, it disconnects
     cleanly from the broker.
+
+    :param int metrics_port: Optional. If provided, enables Prometheus metrics
+        collection on this port. Requires prometheus_client to be installed.
 
     :param msgs: a list of messages to publish. Each message is either a dict or a
            tuple.
@@ -192,6 +196,9 @@ def multiple(
         transport=transport,
     )
 
+    if metrics_port is not None:
+        client.enable_metrics(metrics_port)
+
     client.enable_logger()
     client.on_publish = _on_publish
     client.on_connect = _on_connect  # type: ignore
@@ -243,8 +250,12 @@ def single(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    metrics_port: int | None = None,
 ) -> None:
     """Publish a single message to a broker, then disconnect cleanly.
+
+    :param int metrics_port: Optional. If provided, enables Prometheus metrics
+        collection on this port. Requires prometheus_client to be installed.
 
     This function creates an MQTT client, connects to a broker and publishes a
     single message. Once the message has been delivered, it disconnects cleanly
@@ -303,4 +314,4 @@ def single(
     msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
 
     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
-             protocol, transport, proxy_args)
+             protocol, transport, proxy_args, metrics_port)

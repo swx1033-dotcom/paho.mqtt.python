@@ -1,0 +1,449 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index e990812..513ee07 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -40,6 +40,9 @@ dependencies = []
+ proxy = [
+     "PySocks",
+ ]
++metrics = [
++    "prometheus-client",
++]
+ 
+ [project.urls]
+ Homepage = "http://eclipse.org/paho"
+diff --git a/src/paho/mqtt/client.py b/src/paho/mqtt/client.py
+index 4ccc869..ecdea47 100644
+--- a/src/paho/mqtt/client.py
++++ b/src/paho/mqtt/client.py
+@@ -39,6 +39,17 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, NamedTupl
+ 
+ from paho.mqtt.packettypes import PacketTypes
+ 
++try:
++    from prometheus_client import Counter, Gauge, Histogram, start_http_server, REGISTRY, CollectorRegistry, write_to_textfile
++    _PROMETHEUS_AVAILABLE = True
++except ImportError:
++    _PROMETHEUS_AVAILABLE = False
++    Counter = Gauge = Histogram = None
++    start_http_server = None
++    REGISTRY = None
++    CollectorRegistry = None
++    write_to_textfile = None
++
+ from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
+ from .matcher import MQTTMatcher
+ from .properties import Properties
+@@ -875,10 +886,203 @@ class Client:
+         # for clean_start == MQTT_CLEAN_START_FIRST_ONLY
+         self._mqttv5_first_connect = True
+         self.suppress_exceptions = False # For callbacks
++        self._metrics_enabled = False
++        self._metrics_registry: CollectorRegistry | None = None
++        self._metrics_http_server_port: int | None = None
++        self._metric_messages_published_total: Counter | None = None
++        self._metric_messages_received_total: Counter | None = None
++        self._metric_bytes_published_total: Counter | None = None
++        self._metric_bytes_received_total: Counter | None = None
++        self._metric_reconnect_total: Counter | None = None
++        self._metric_connection_status: Gauge | None = None
++        self._metric_publish_latency_seconds: Histogram | None = None
++        self._metric_inflight_messages: Gauge | None = None
++        self._metric_queued_messages: Gauge | None = None
++        self._metric_publish_errors_total: Counter | None = None
++        self._metric_subscribe_total: Counter | None = None
++        self._metric_unsubscribe_total: Counter | None = None
+ 
+     def __del__(self) -> None:
+         self._reset_sockets()
+ 
++    def enable_metrics(self, port: int = 9090) -> bool:
++        """启用 Prometheus 指标收集并启动 HTTP 端点。
++
++        :param int port: Prometheus HTTP 服务器监听端口，默认为 9090
++        :return: 如果成功启用返回 True，否则返回 False
++        """
++        if not _PROMETHEUS_AVAILABLE:
++            self._easy_log(
++                MQTT_LOG_WARNING,
++                "prometheus_client 未安装，无法启用指标收集。请先安装: pip install prometheus-client"
++            )
++            return False
++
++        if self._metrics_enabled:
++            self._easy_log(MQTT_LOG_DEBUG, "指标收集已启用")
++            return True
++
++        try:
++            self._metrics_registry = CollectorRegistry()
++            self._metrics_http_server_port = port
++
++            client_id_str = self._client_id.decode() if isinstance(self._client_id, bytes) else str(self._client_id)
++            labels = {'client_id': client_id_str or 'unknown'}
++
++            self._metric_messages_published_total = Counter(
++                'mqtt_messages_published_total',
++                'Total number of MQTT messages published',
++                ['client_id', 'qos'],
++                registry=self._metrics_registry
++            )
++            self._metric_messages_received_total = Counter(
++                'mqtt_messages_received_total',
++                'Total number of MQTT messages received',
++                ['client_id', 'qos'],
++                registry=self._metrics_registry
++            )
++            self._metric_bytes_published_total = Counter(
++                'mqtt_bytes_published_total',
++                'Total number of bytes published',
++                ['client_id'],
++                registry=self._metrics_registry
++            )
++            self._metric_bytes_received_total = Counter(
++                'mqtt_bytes_received_total',
++                'Total number of bytes received',
++                ['client_id'],
++                registry=self._metrics_registry
++            )
++            self._metric_reconnect_total = Counter(
++                'mqtt_reconnect_total',
++                'Total number of reconnection attempts',
++                ['client_id'],
++                registry=self._metrics_registry
++            )
++            self._metric_connection_status = Gauge(
++                'mqtt_connection_status',
++                'MQTT connection status (1=connected, 0=disconnected)',
++                ['client_id'],
++                registry=self._metrics_registry
++            )
++            self._metric_publish_latency_seconds = Histogram(
++                'mqtt_publish_latency_seconds',
++                'Publish latency in seconds',
++                ['client_id', 'qos'],
++                registry=self._metrics_registry
++            )
++            self._metric_inflight_messages = Gauge(
++                'mqtt_inflight_messages',
++                'Number of in-flight messages',
++                ['client_id'],
++                registry=self._metrics_registry
++            )
++            self._metric_queued_messages = Gauge(
++                'mqtt_queued_messages',
++                'Number of queued messages',
++                ['client_id'],
++                registry=self._metrics_registry
++            )
++            self._metric_publish_errors_total = Counter(
++                'mqtt_publish_errors_total',
++                'Total number of publish errors',
++                ['client_id', 'error_type'],
++                registry=self._metrics_registry
++            )
++            self._metric_subscribe_total = Counter(
++                'mqtt_subscribe_total',
++                'Total number of subscribe requests',
++                ['client_id'],
++                registry=self._metrics_registry
++            )
++            self._metric_unsubscribe_total = Counter(
++                'mqtt_unsubscribe_total',
++                'Total number of unsubscribe requests',
++                ['client_id'],
++                registry=self._metrics_registry
++            )
++
++            self._metrics_enabled = True
++            self._update_connection_status_gauge()
++            self._update_message_gauges()
++
++            try:
++                start_http_server(port, registry=self._metrics_registry)
++                self._easy_log(
++                    MQTT_LOG_INFO,
++                    "Prometheus 指标服务器已启动，监听端口 %d",
++                    port
++                )
++            except OSError:
++                self._easy_log(
++                    MQTT_LOG_WARNING,
++                    "端口 %d 已被占用，指标已启用但 HTTP 服务器未启动",
++                    port
++                )
++
++            return True
++        except Exception as e:
++            self._easy_log(MQTT_LOG_ERR, "启用指标收集失败: %s", str(e))
++            self._metrics_enabled = False
++            return False
++
++    def disable_metrics(self) -> None:
++        """禁用 Prometheus 指标收集。"""
++        self._metrics_enabled = False
++        self._metrics_registry = None
++        self._metric_messages_published_total = None
++        self._metric_messages_received_total = None
++        self._metric_bytes_published_total = None
++        self._metric_bytes_received_total = None
++        self._metric_reconnect_total = None
++        self._metric_connection_status = None
++        self._metric_publish_latency_seconds = None
++        self._metric_inflight_messages = None
++        self._metric_queued_messages = None
++        self._metric_publish_errors_total = None
++        self._metric_subscribe_total = None
++        self._metric_unsubscribe_total = None
++        self._easy_log(MQTT_LOG_INFO, "指标收集已禁用")
++
++    def get_metrics_registry(self):
++        """获取当前使用的 Prometheus CollectorRegistry 实例。"""
++        return self._metrics_registry
++
++    def export_metrics_to_file(self, filepath: str) -> bool:
++        """将当前指标导出到文本文件（用于调试）。
++
++        :param str filepath: 输出文件路径
++        :return: 成功返回 True，否则返回 False
++        """
++        if not self._metrics_enabled or not self._metrics_registry:
++            self._easy_log(MQTT_LOG_WARNING, "指标未启用，无法导出")
++            return False
++        try:
++            write_to_textfile(filepath, self._metrics_registry)
++            return True
++        except Exception as e:
++            self._easy_log(MQTT_LOG_ERR, "导出指标失败: %s", str(e))
++            return False
++
++    def _get_client_id_label(self) -> str:
++        return self._client_id.decode() if isinstance(self._client_id, bytes) else str(self._client_id or 'unknown')
++
++    def _update_connection_status_gauge(self) -> None:
++        if not self._metrics_enabled or self._metric_connection_status is None:
++            return
++        label = self._get_client_id_label()
++        status = 1 if self._state == _ConnectionState.MQTT_CS_CONNECTED else 0
++        self._metric_connection_status.labels(client_id=label).set(status)
++
++    def _update_message_gauges(self) -> None:
++        if not self._metrics_enabled:
++            return
++        label = self._get_client_id_label()
++        if self._metric_inflight_messages is not None:
++            self._metric_inflight_messages.labels(client_id=label).set(self._inflight_messages)
++        if self._metric_queued_messages is not None:
++            self._metric_queued_messages.labels(client_id=label).set(len(self._out_messages))
++
+     @property
+     def host(self) -> str:
+         """
+@@ -1551,6 +1755,11 @@ class Client:
+         if self._port <= 0:
+             raise ValueError('Invalid port number.')
+ 
++        if self._metrics_enabled and self._metric_reconnect_total is not None:
++            _label = self._get_client_id_label()
++            self._metric_reconnect_total.labels(client_id=_label).inc()
++            self._update_connection_status_gauge()
++
+         self._in_packet = {
+             "command": 0,
+             "have_remaining": 0,
+@@ -1767,6 +1976,7 @@ class Client:
+         if len(local_payload) > 268435455:
+             raise ValueError('Payload too large.')
+ 
++        _publish_start_time = time_func()
+         local_mid = self._mid_generate()
+ 
+         if qos == 0:
+@@ -1774,6 +1984,19 @@ class Client:
+             rc = self._send_publish(
+                 local_mid, topic_bytes, local_payload, qos, retain, False, info, properties)
+             info.rc = rc
++            if self._metrics_enabled:
++                _label = self._get_client_id_label()
++                if rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
++                    if self._metric_messages_published_total is not None:
++                        self._metric_messages_published_total.labels(client_id=_label, qos=str(qos)).inc()
++                    if self._metric_bytes_published_total is not None:
++                        self._metric_bytes_published_total.labels(client_id=_label).inc(len(local_payload))
++                    if self._metric_publish_latency_seconds is not None:
++                        self._metric_publish_latency_seconds.labels(client_id=_label, qos=str(qos)).observe(time_func() - _publish_start_time)
++                else:
++                    if self._metric_publish_errors_total is not None:
++                        self._metric_publish_errors_total.labels(client_id=_label, error_type=str(rc)).inc()
++                self._update_message_gauges()
+             return info
+         else:
+             message = MQTTMessage(local_mid, topic_bytes)
+@@ -1787,10 +2010,20 @@ class Client:
+             with self._out_message_mutex:
+                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
+                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
++                    if self._metrics_enabled:
++                        _label = self._get_client_id_label()
++                        if self._metric_publish_errors_total is not None:
++                            self._metric_publish_errors_total.labels(client_id=_label, error_type='QUEUE_SIZE').inc()
++                        self._update_message_gauges()
+                     return message.info
+ 
+                 if local_mid in self._out_messages:
+                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
++                    if self._metrics_enabled:
++                        _label = self._get_client_id_label()
++                        if self._metric_publish_errors_total is not None:
++                            self._metric_publish_errors_total.labels(client_id=_label, error_type='QUEUE_SIZE').inc()
++                        self._update_message_gauges()
+                     return message.info
+ 
+                 self._out_messages[message.mid] = message
+@@ -1810,10 +2043,25 @@ class Client:
+                         message.state = mqtt_ms_publish
+ 
+                     message.info.rc = rc
++                    if self._metrics_enabled:
++                        _label = self._get_client_id_label()
++                        if rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
++                            if self._metric_messages_published_total is not None:
++                                self._metric_messages_published_total.labels(client_id=_label, qos=str(qos)).inc()
++                            if self._metric_bytes_published_total is not None:
++                                self._metric_bytes_published_total.labels(client_id=_label).inc(len(local_payload))
++                            if self._metric_publish_latency_seconds is not None:
++                                self._metric_publish_latency_seconds.labels(client_id=_label, qos=str(qos)).observe(time_func() - _publish_start_time)
++                        else:
++                            if self._metric_publish_errors_total is not None:
++                                self._metric_publish_errors_total.labels(client_id=_label, error_type=str(rc)).inc()
++                        self._update_message_gauges()
+                     return message.info
+                 else:
+                     message.state = mqtt_ms_queued
+                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
++                    if self._metrics_enabled:
++                        self._update_message_gauges()
+                     return message.info
+ 
+     def username_pw_set(
+@@ -1885,9 +2133,13 @@ class Client:
+         """
+         if self._sock is None:
+             self._state = _ConnectionState.MQTT_CS_DISCONNECTED
++            if self._metrics_enabled:
++                self._update_connection_status_gauge()
+             return MQTT_ERR_NO_CONN
+         else:
+             self._state = _ConnectionState.MQTT_CS_DISCONNECTING
++            if self._metrics_enabled:
++                self._update_connection_status_gauge()
+ 
+         return self._send_disconnect(reasoncode, properties)
+ 
+@@ -2035,6 +2287,10 @@ class Client:
+         if self._sock is None:
+             return (MQTT_ERR_NO_CONN, None)
+ 
++        if self._metrics_enabled and self._metric_subscribe_total is not None:
++            _label = self._get_client_id_label()
++            self._metric_subscribe_total.labels(client_id=_label).inc()
++
+         return self._send_subscribe(False, topic_qos_list, properties)
+ 
+     def unsubscribe(
+@@ -2077,6 +2333,10 @@ class Client:
+         if self._sock is None:
+             return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
+ 
++        if self._metrics_enabled and self._metric_unsubscribe_total is not None:
++            _label = self._get_client_id_label()
++            self._metric_unsubscribe_total.labels(client_id=_label).inc()
++
+         return self._send_unsubscribe(False, topic_list, properties)
+ 
+     def loop_read(self, max_packets: int = 1) -> MQTTErrorCode:
+@@ -2145,6 +2405,10 @@ class Client:
+         if self._sock is None:
+             return MQTTErrorCode.MQTT_ERR_NO_CONN
+ 
++        if self._metrics_enabled:
++            self._update_connection_status_gauge()
++            self._update_message_gauges()
++
+         now = time_func()
+         self._check_keepalive()
+ 
+@@ -3891,6 +4155,8 @@ class Client:
+         if result == 0:
+             self._state = _ConnectionState.MQTT_CS_CONNECTED
+             self._reconnect_delay = None
++            if self._metrics_enabled:
++                self._update_connection_status_gauge()
+ 
+         if self._protocol == MQTTv5:
+             self._easy_log(
+@@ -4140,6 +4406,13 @@ class Client:
+                 print_topic, len(message.payload)
+             )
+ 
++        if self._metrics_enabled:
++            _label = self._get_client_id_label()
++            if self._metric_messages_received_total is not None:
++                self._metric_messages_received_total.labels(client_id=_label, qos=str(message.qos)).inc()
++            if self._metric_bytes_received_total is not None:
++                self._metric_bytes_received_total.labels(client_id=_label).inc(len(message.payload))
++
+         message.timestamp = time_func()
+         if message.qos == 0:
+             self._handle_on_message(message)
+diff --git a/src/paho/mqtt/publish.py b/src/paho/mqtt/publish.py
+index 333c190..da9faee 100644
+--- a/src/paho/mqtt/publish.py
++++ b/src/paho/mqtt/publish.py
+@@ -115,6 +115,7 @@ def multiple(
+     protocol: MQTTProtocolVersion = paho.MQTTv311,
+     transport: Literal["tcp", "websockets"] = "tcp",
+     proxy_args: Any | None = None,
++    metrics_port: int | None = None,
+ ) -> None:
+     """Publish multiple messages to a broker, then disconnect cleanly.
+ 
+@@ -122,6 +123,9 @@ def multiple(
+     list of messages. Once the messages have been delivered, it disconnects
+     cleanly from the broker.
+ 
++    :param int metrics_port: Optional. If provided, enables Prometheus metrics
++        collection on this port. Requires prometheus_client to be installed.
++
+     :param msgs: a list of messages to publish. Each message is either a dict or a
+            tuple.
+ 
+@@ -192,6 +196,9 @@ def multiple(
+         transport=transport,
+     )
+ 
++    if metrics_port is not None:
++        client.enable_metrics(metrics_port)
++
+     client.enable_logger()
+     client.on_publish = _on_publish
+     client.on_connect = _on_connect  # type: ignore
+@@ -243,9 +250,13 @@ def single(
+     protocol: MQTTProtocolVersion = paho.MQTTv311,
+     transport: Literal["tcp", "websockets"] = "tcp",
+     proxy_args: Any | None = None,
++    metrics_port: int | None = None,
+ ) -> None:
+     """Publish a single message to a broker, then disconnect cleanly.
+ 
++    :param int metrics_port: Optional. If provided, enables Prometheus metrics
++        collection on this port. Requires prometheus_client to be installed.
++
+     This function creates an MQTT client, connects to a broker and publishes a
+     single message. Once the message has been delivered, it disconnects cleanly
+     from the broker.
+@@ -303,4 +314,4 @@ def single(
+     msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
+ 
+     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
+-             protocol, transport, proxy_args)
++             protocol, transport, proxy_args, metrics_port)

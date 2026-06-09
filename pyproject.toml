@@ -40,6 +40,9 @@ dependencies = []
 proxy = [
     "PySocks",
 ]
+metrics = [
+    "prometheus-client",
+]
 
 [project.urls]
 Homepage = "http://eclipse.org/paho"

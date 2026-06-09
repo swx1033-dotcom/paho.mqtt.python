@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+
+"""
+Multi-Client MQTT Example Using selectors Module
+
+This example demonstrates how to manage multiple MQTT clients simultaneously
+using Python's selectors module. It shows proper handling of:
+- Registering/unregistering sockets for read/write operations
+- Client disconnect and reconnect scenarios
+- Integrating loop_misc() with selector timeout management
+- Avoiding common pitfalls with external event loops
+
+Key concepts:
+1. Each MQTT client has its own socket that must be registered with the selector
+2. The on_socket_register_write/on_socket_unregister_write callbacks tell us when
+   there is data waiting to be written to the socket
+3. loop_misc() must be called regularly to handle keepalive pings and message retries
+4. selector.select(timeout) should use the minimum remaining time across all clients
+   to ensure loop_misc() is called frequently enough
+
+Common pitfalls to avoid:
+- Not unregistering sockets when clients disconnect (causes selector errors)
+- Using a fixed timeout that's too long (causes keepalive failures)
+- Not handling the case where socket() returns None after disconnect
+- Forgetting to re-register sockets after reconnection
+"""
+
+import selectors
+import socket
+import uuid
+from time import time, sleep
+
+import paho.mqtt.client as mqtt
+
+
+class MqttClientWrapper:
+    """Wrapper for a single MQTT client that manages selector registration."""
+
+    def __init__(self, client_id: str, selector: selectors.BaseSelector, index: int):
+        self.index = index
+        self.client_id = client_id
+        self.selector = selector
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+        self.connected = False
+        self.message_count = 0
+        self.publish_interval = 5  # seconds between publishes
+        self.last_publish_time = time()
+        self.state = 0  # Track publish state
+
+        # Setup callbacks
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.on_disconnect = self.on_disconnect
+        self.client.on_socket_open = self.on_socket_open
+        self.client.on_socket_close = self.on_socket_close
+        self.client.on_socket_register_write = self.on_socket_register_write
+        self.client.on_socket_unregister_write = self.on_socket_unregister_write
+
+    def connect(self, host: str, port: int, keepalive: int = 60):
+        """Connect to the MQTT broker."""
+        print(f"[Client {self.index}] Connecting to {host}:{port}")
+        self.client.connect(host, port, keepalive)
+
+    def on_connect(self, client, userdata, flags, reason_code, properties):
+        """Called when the broker responds to our connection request."""
+        if reason_code == 0:
+            self.connected = True
+            print(f"[Client {self.index}] Connected successfully")
+            # Subscribe to our unique topic
+            topic = f"multi-client/test/{self.client_id}"
+            print(f"[Client {self.index}] Subscribing to {topic}")
+            client.subscribe(topic)
+        else:
+            print(f"[Client {self.index}] Failed to connect, reason: {reason_code}")
+            self.connected = False
+
+    def on_message(self, client, userdata, msg):
+        """Called when a PUBLISH message is received from the server."""
+        self.message_count += 1
+        print(f"[Client {self.index}] Received message #{self.message_count} on {msg.topic}: {msg.payload[:50]}...")
+
+    def on_disconnect(self, client, userdata, flags, reason_code, properties):
+        """Called when the client disconnects from the broker."""
+        self.connected = False
+        print(f"[Client {self.index}] Disconnected, reason: {reason_code}")
+
+    def on_socket_open(self, client, userdata, sock):
+        """Called when the socket is opened. Register for reading."""
+        print(f"[Client {self.index}] Socket opened, registering for read")
+        # Register socket for reading events
+        # EVENT_READ triggers when there is data available to read
+        self.selector.register(sock, selectors.EVENT_READ, data=self)
+
+    def on_socket_close(self, client, userdata, sock):
+        """Called when the socket is about to be closed. Unregister from selector."""
+        print(f"[Client {self.index}] Socket closing, unregistering from selector")
+        # IMPORTANT: Always unregister the socket before it's closed
+        # Failure to do so will cause selector.select() to fail with invalid fd
+        try:
+            self.selector.unregister(sock)
+        except (KeyError, ValueError):
+            # Socket may already be unregistered, ignore
+            pass
+
+    def on_socket_register_write(self, client, userdata, sock):
+        """Called when there is data waiting to be written. Register for writing."""
+        print(f"[Client {self.index}] Registering socket for write")
+        # Modify registration to include write events
+        # EVENT_WRITE triggers when the socket is ready for writing
+        self.selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, data=self)
+
+    def on_socket_unregister_write(self, client, userdata, sock):
+        """Called when there is no more data to write. Unregister write events."""
+        print(f"[Client {self.index}] Unregistering socket for write")
+        # Modify registration to only listen for read events
+        self.selector.modify(sock, selectors.EVENT_READ, data=self)
+
+    def get_publish_topic(self) -> str:
+        """Get the topic this client should publish to."""
+        return f"multi-client/test/{self.client_id}"
+
+    def handle_publish(self):
+        """Handle periodic message publishing."""
+        now = time()
+        if now - self.last_publish_time >= self.publish_interval:
+            if self.state in {0, 2, 4}:
+                topic = self.get_publish_topic()
+                payload = f"Hello from client {self.index}".encode() * 100
+                print(f"[Client {self.index}] Publishing to {topic}")
+                self.client.publish(topic, payload, qos=1)
+                self.state += 1
+                self.last_publish_time = now
+            elif self.state == 6:
+                # All publishes done, disconnect
+                print(f"[Client {self.index}] All messages published, disconnecting")
+                self.client.disconnect()
+                return True
+        return False
+
+    def get_time_until_next_publish(self) -> float:
+        """Get seconds until next publish is due."""
+        elapsed = time() - self.last_publish_time
+        return max(0, self.publish_interval - elapsed)
+
+
+class MultiClientMqttExample:
+    """Manages multiple MQTT clients using a single selector."""
+
+    def __init__(self):
+        # Create a selector using the best implementation for the platform
+        # DefaultSelector uses epoll on Linux, kqueue on macOS, select on Windows
+        self.selector = selectors.DefaultSelector()
+        self.clients: list[MqttClientWrapper] = []
+        self.running = True
+
+    def add_client(self, host: str, port: int, keepalive: int = 60) -> MqttClientWrapper:
+        """Create and add a new MQTT client to the manager."""
+        client_id = 'paho-multi-client/' + str(uuid.uuid4())
+        wrapper = MqttClientWrapper(client_id, self.selector, len(self.clients))
+        wrapper.connect(host, port, keepalive)
+        self.clients.append(wrapper)
+        return wrapper
+
+    def calculate_select_timeout(self) -> float:
+        """
+        Calculate the optimal timeout for selector.select().
+
+        IMPORTANT: The timeout must be small enough to ensure loop_misc() is called
+        frequently enough to handle keepalive pings. If the timeout is too long,
+        the client may miss its keepalive window and be disconnected by the broker.
+
+        A safe approach is to use the minimum of:
+        1. A reasonable maximum wait time (e.g., 1 second)
+        2. Time until next publish for any client
+        3. Half the keepalive interval (to ensure timely ping handling)
+        """
+        # Default maximum timeout - loop_misc() should be called at least this often
+        timeout = 1.0
+
+        for client_wrapper in self.clients:
+            if not client_wrapper.connected:
+                continue
+
+            # Check time until next publish
+            publish_timeout = client_wrapper.get_time_until_next_publish()
+            if publish_timeout < timeout:
+                timeout = publish_timeout
+
+            # Safety check: ensure timeout is never more than half the keepalive
+            # This ensures loop_misc() runs frequently enough for ping handling
+            keepalive = client_wrapper.client.keepalive
+            if keepalive > 0:
+                keepalive_timeout = keepalive / 2.0
+                if keepalive_timeout < timeout:
+                    timeout = keepalive_timeout
+
+        return max(0.1, timeout)  # Never wait less than 100ms
+
+    def process_client_events(self, key: selectors.SelectorKey, mask: int):
+        """Process I/O events for a single client."""
+        client_wrapper = key.data
+        client = client_wrapper.client
+
+        # Check if the socket is still valid
+        # IMPORTANT: After disconnect, socket() returns None
+        sock = client.socket()
+        if sock is None:
+            print(f"[Client {client_wrapper.index}] Socket no longer available")
+            return
+
+        # Handle read events
+        if mask & selectors.EVENT_READ:
+            # loop_read() processes incoming data from the broker
+            # This includes PUBLISH messages, PUBACK, PINGRESP, etc.
+            client.loop_read()
+
+        # Handle write events
+        if mask & selectors.EVENT_WRITE:
+            # loop_write() sends pending data to the broker
+            # This is triggered when there are outgoing packets to send
+            client.loop_write()
+
+        # Always call loop_misc() after processing I/O
+        # This handles keepalive pings and message retries
+        # IMPORTANT: Must be called regularly (at least every keepalive/2 seconds)
+        result = client.loop_misc()
+        if result != mqtt.MQTT_ERR_SUCCESS:
+            print(f"[Client {client_wrapper.index}] loop_misc() returned {result}")
+
+    def run(self):
+        """Main event loop that processes all clients."""
+        print("Starting multi-client MQTT example")
+        print(f"Managing {len(self.clients)} clients")
+
+        while self.running:
+            # Check if all clients are done
+            active_clients = [c for c in self.clients if c.connected or c.client.socket() is not None]
+            if not active_clients:
+                print("All clients disconnected, exiting")
+                break
+
+            # Calculate optimal timeout for this iteration
+            timeout = self.calculate_select_timeout()
+
+            # Wait for I/O events on any registered socket
+            # select() blocks until at least one fd is ready or timeout expires
+            events = self.selector.select(timeout=timeout)
+
+            # Process all ready events
+            for key, mask in events:
+                self.process_client_events(key, mask)
+
+            # Handle periodic publishing for connected clients
+            for client_wrapper in self.clients:
+                if client_wrapper.connected:
+                    done = client_wrapper.handle_publish()
+                    if done:
+                        # This client is done, but others may continue
+                        pass
+
+        # Cleanup: ensure all clients are properly closed
+        print("Shutting down...")
+        for client_wrapper in self.clients:
+            try:
+                client_wrapper.client.disconnect()
+            except Exception:
+                pass
+        self.selector.close()
+        print("Finished")
+
+
+def main():
+    """Entry point for the multi-client MQTT example."""
+    example = MultiClientMqttExample()
+
+    # Add two MQTT clients connecting to the same broker
+    # Each client will have its own connection and topic
+    example.add_client('mqtt.eclipseprojects.io', 1883, keepalive=60)
+    example.add_client('mqtt.eclipseprojects.io', 1883, keepalive=60)
+
+    # Run the main event loop
+    example.run()
+
+
+if __name__ == '__main__':
+    print("Starting multi-client MQTT example")
+    main()
+    print("All done!")

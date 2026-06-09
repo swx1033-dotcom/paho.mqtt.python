@@ -28,11 +28,43 @@ def _on_connect(client, userdata, flags, reason_code, properties):
     if reason_code != 0:
         raise mqtt.MQTTException(paho.connack_string(reason_code))
 
+    # First subscribe to the requested topics
     if isinstance(userdata['topics'], list):
         for topic in userdata['topics']:
             client.subscribe(topic, userdata['qos'])
     else:
         client.subscribe(userdata['topics'], userdata['qos'])
+
+    # Then replay any previously persisted subscriptions so they are
+    # re-registered with the broker after a reconnect/new session.
+    store = client.session_store() if hasattr(client, 'session_store') else None
+    if store is not None:
+        try:
+            persisted = store.get_subscriptions(client._client_id)
+            for topic, qos, options in persisted:
+                # Skip topics we just subscribed to above (avoid double sub)
+                if isinstance(userdata['topics'], list):
+                    already_subscribed = any(
+                        (t == topic or (isinstance(t, tuple) and t[0] == topic))
+                        for t in userdata['topics']
+                    )
+                else:
+                    already_subscribed = userdata['topics'] == topic
+                if already_subscribed:
+                    continue
+                if options is not None:
+                    client.subscribe((topic, options))
+                else:
+                    client.subscribe(topic, qos)
+        except Exception as err:
+            # Non-fatal: persistence replay failure should not break connection
+            try:
+                client._easy_log(
+                    paho.MQTT_LOG_ERR,
+                    "Failed to replay persisted subscriptions: %s", err,
+                )
+            except Exception:
+                pass
 
 
 def _on_message_callback(client, userdata, message):
@@ -65,7 +97,7 @@ def _on_message_simple(client, userdata, message):
 def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
              port=1883, client_id="", keepalive=60, will=None, auth=None,
              tls=None, protocol=paho.MQTTv311, transport="tcp",
-             clean_session=True, proxy_args=None):
+             clean_session=True, proxy_args=None, session_store=None):
     """Subscribe to a list of topics and process them in a callback function.
 
     This function creates an MQTT client, connects to a broker and subscribes
@@ -146,6 +178,7 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
         protocol=protocol,
         transport=transport,
         clean_session=clean_session,
+        session_store=session_store,
     )
     client.enable_logger()
 
@@ -186,7 +219,7 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
 def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
            port=1883, client_id="", keepalive=60, will=None, auth=None,
            tls=None, protocol=paho.MQTTv311, transport="tcp",
-           clean_session=True, proxy_args=None):
+           clean_session=True, proxy_args=None, session_store=None):
     """Subscribe to a list of topics and return msg_count messages.
 
     This function creates an MQTT client, connects to a broker and subscribes
@@ -276,6 +309,6 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
 
     callback(_on_message_simple, topics, qos, userdata, hostname, port,
              client_id, keepalive, will, auth, tls, protocol, transport,
-             clean_session, proxy_args)
+             clean_session, proxy_args, session_store)
 
     return userdata['messages']

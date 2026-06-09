@@ -18,15 +18,18 @@ protocol that is easy to implement and suitable for low powered devices.
 """
 from __future__ import annotations
 
+import abc
 import base64
 import collections
 import errno
 import hashlib
+import json
 import logging
 import os
 import platform
 import select
 import socket
+import sqlite3
 import string
 import struct
 import threading
@@ -628,6 +631,443 @@ class MQTTMessage:
         self._topic = value
 
 
+class SessionStore(abc.ABC):
+    """Abstract base class for MQTT session persistence stores.
+
+    A session store persists the client session state (outgoing messages,
+    incoming messages, subscriptions, and last message id) so that the state
+    can survive client restarts, which is particularly important when
+    ``clean_session=False`` or ``clean_start=False``.
+    """
+
+    @abc.abstractmethod
+    def put_outgoing_message(self, client_id: str, message: MQTTMessage) -> None:
+        """Persist (insert or update) an outgoing QoS 1/2 message."""
+
+    @abc.abstractmethod
+    def del_outgoing_message(self, client_id: str, mid: int) -> None:
+        """Remove a persisted outgoing message by message id."""
+
+    @abc.abstractmethod
+    def get_outgoing_messages(self, client_id: str) -> Dict[int, MQTTMessage]:
+        """Return all persisted outgoing messages indexed by message id."""
+
+    @abc.abstractmethod
+    def put_incoming_message(self, client_id: str, message: MQTTMessage) -> None:
+        """Persist (insert or update) an incoming QoS 2 message."""
+
+    @abc.abstractmethod
+    def del_incoming_message(self, client_id: str, mid: int) -> None:
+        """Remove a persisted incoming message by message id."""
+
+    @abc.abstractmethod
+    def get_incoming_messages(self, client_id: str) -> Dict[int, MQTTMessage]:
+        """Return all persisted incoming messages indexed by message id."""
+
+    @abc.abstractmethod
+    def put_subscription(
+        self,
+        client_id: str,
+        topic: str,
+        qos: int,
+        options: SubscribeOptions | None = None,
+    ) -> None:
+        """Persist a subscription."""
+
+    @abc.abstractmethod
+    def del_subscription(self, client_id: str, topic: str) -> None:
+        """Remove a persisted subscription by topic filter."""
+
+    @abc.abstractmethod
+    def get_subscriptions(
+        self, client_id: str
+    ) -> List[Tuple[str, int, SubscribeOptions | None]]:
+        """Return persisted subscriptions as list of (topic, qos, options)."""
+
+    @abc.abstractmethod
+    def put_last_mid(self, client_id: str, mid: int) -> None:
+        """Persist the last used message id."""
+
+    @abc.abstractmethod
+    def get_last_mid(self, client_id: str) -> int:
+        """Return the last persisted message id, or 0 if unknown."""
+
+    @abc.abstractmethod
+    def clear_session(self, client_id: str) -> None:
+        """Remove all persisted state for the given client id."""
+
+    @abc.abstractmethod
+    def close(self) -> None:
+        """Release underlying resources (file handles, connections, ...)."""
+
+
+class SQLiteSessionStore(SessionStore):
+    """An SQLite-backed :class:`SessionStore` with transactions and concurrent
+    access (via per-connection threading locks).
+    """
+
+    _SCHEMA = """
+        CREATE TABLE IF NOT EXISTS outgoing_messages (
+            client_id   TEXT    NOT NULL,
+            mid         INTEGER NOT NULL,
+            state       INTEGER NOT NULL,
+            qos         INTEGER NOT NULL,
+            retain      INTEGER NOT NULL,
+            dup         INTEGER NOT NULL,
+            topic       TEXT    NOT NULL,
+            payload     BLOB    NOT NULL,
+            timestamp   REAL    NOT NULL,
+            PRIMARY KEY (client_id, mid)
+        );
+
+        CREATE TABLE IF NOT EXISTS incoming_messages (
+            client_id   TEXT    NOT NULL,
+            mid         INTEGER NOT NULL,
+            state       INTEGER NOT NULL,
+            qos         INTEGER NOT NULL,
+            retain      INTEGER NOT NULL,
+            dup         INTEGER NOT NULL,
+            topic       TEXT    NOT NULL,
+            payload     BLOB    NOT NULL,
+            timestamp   REAL    NOT NULL,
+            PRIMARY KEY (client_id, mid)
+        );
+
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            client_id   TEXT    NOT NULL,
+            topic       TEXT    NOT NULL,
+            qos         INTEGER NOT NULL,
+            options_json TEXT   DEFAULT NULL,
+            PRIMARY KEY (client_id, topic)
+        );
+
+        CREATE TABLE IF NOT EXISTS last_mid (
+            client_id   TEXT    PRIMARY KEY,
+            mid         INTEGER NOT NULL
+        );
+    """
+
+    def __init__(self, database: str = ":memory:") -> None:
+        """Create an SQLite session store.
+
+        :param database: path to the SQLite database file, or ``":memory:""``
+            for an in-memory store (the default).
+        """
+        self.database = database
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            # check_same_thread=False + our own lock => thread-safe access
+            self._conn = sqlite3.connect(
+                self.database,
+                check_same_thread=False,
+                isolation_level=None,  # auto-commit; we use explicit transactions
+            )
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA foreign_keys=ON;")
+        return self._conn
+
+    def _init_db(self) -> None:
+        with self._lock:
+            conn = self._get_conn()
+            conn.executescript(self._SCHEMA)
+
+    def _serialize_options(self, options: SubscribeOptions | None) -> str | None:
+        if options is None:
+            return None
+        try:
+            data = {
+                "qos": int(options.qos),
+                "no_local": bool(getattr(options, "no_local", False)),
+                "retain_as_published": bool(
+                    getattr(options, "retain_as_published", False)
+                ),
+                "retain_handling": int(getattr(options, "retain_handling", 0)),
+            }
+            return json.dumps(data)
+        except Exception:
+            return None
+
+    def _deserialize_options(
+        self, options_json: str | None
+    ) -> SubscribeOptions | None:
+        if not options_json:
+            return None
+        try:
+            data = json.loads(options_json)
+            return SubscribeOptions(
+                qos=data.get("qos", 0),
+                no_local=data.get("no_local", False),
+                retain_as_published=data.get("retain_as_published", False),
+                retain_handling=data.get("retain_handling", 0),
+            )
+        except Exception:
+            return None
+
+    def _msg_to_row(self, message: MQTTMessage) -> tuple:
+        return (
+            int(message.state),
+            int(message.qos),
+            1 if message.retain else 0,
+            1 if message.dup else 0,
+            message.topic,
+            bytes(message.payload) if message.payload is not None else b"",
+            float(message.timestamp),
+        )
+
+    def _row_to_msg(self, mid: int, row: tuple) -> MQTTMessage:
+        state, qos, retain, dup, topic_str, payload, timestamp = row
+        msg = MQTTMessage(mid=mid, topic=topic_str.encode("utf-8"))
+        msg.state = int(state)
+        msg.qos = int(qos)
+        msg.retain = bool(retain)
+        msg.dup = bool(dup)
+        msg.payload = bytes(payload) if payload is not None else b""
+        msg.timestamp = float(timestamp)
+        return msg
+
+    def put_outgoing_message(self, client_id: str, message: MQTTMessage) -> None:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        row = (cid, message.mid) + self._msg_to_row(message)
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO outgoing_messages
+                        (client_id, mid, state, qos, retain, dup, topic, payload, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(client_id, mid) DO UPDATE SET
+                        state=excluded.state,
+                        qos=excluded.qos,
+                        retain=excluded.retain,
+                        dup=excluded.dup,
+                        topic=excluded.topic,
+                        payload=excluded.payload,
+                        timestamp=excluded.timestamp;
+                    """,
+                    row,
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def del_outgoing_message(self, client_id: str, mid: int) -> None:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    "DELETE FROM outgoing_messages WHERE client_id = ? AND mid = ?;",
+                    (cid, mid),
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def get_outgoing_messages(self, client_id: str) -> Dict[int, MQTTMessage]:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            cur = conn.execute(
+                """
+                SELECT mid, state, qos, retain, dup, topic, payload, timestamp
+                FROM outgoing_messages WHERE client_id = ? ORDER BY mid;
+                """,
+                (cid,),
+            )
+            rows = cur.fetchall()
+        result: Dict[int, MQTTMessage] = {}
+        for row in rows:
+            mid = row[0]
+            result[mid] = self._row_to_msg(mid, row[1:])
+        return result
+
+    def put_incoming_message(self, client_id: str, message: MQTTMessage) -> None:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        row = (cid, message.mid) + self._msg_to_row(message)
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO incoming_messages
+                        (client_id, mid, state, qos, retain, dup, topic, payload, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(client_id, mid) DO UPDATE SET
+                        state=excluded.state,
+                        qos=excluded.qos,
+                        retain=excluded.retain,
+                        dup=excluded.dup,
+                        topic=excluded.topic,
+                        payload=excluded.payload,
+                        timestamp=excluded.timestamp;
+                    """,
+                    row,
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def del_incoming_message(self, client_id: str, mid: int) -> None:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    "DELETE FROM incoming_messages WHERE client_id = ? AND mid = ?;",
+                    (cid, mid),
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def get_incoming_messages(self, client_id: str) -> Dict[int, MQTTMessage]:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            cur = conn.execute(
+                """
+                SELECT mid, state, qos, retain, dup, topic, payload, timestamp
+                FROM incoming_messages WHERE client_id = ? ORDER BY mid;
+                """,
+                (cid,),
+            )
+            rows = cur.fetchall()
+        result: Dict[int, MQTTMessage] = {}
+        for row in rows:
+            mid = row[0]
+            result[mid] = self._row_to_msg(mid, row[1:])
+        return result
+
+    def put_subscription(
+        self,
+        client_id: str,
+        topic: str,
+        qos: int,
+        options: SubscribeOptions | None = None,
+    ) -> None:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        options_json = self._serialize_options(options)
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO subscriptions (client_id, topic, qos, options_json)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(client_id, topic) DO UPDATE SET
+                        qos=excluded.qos, options_json=excluded.options_json;
+                    """,
+                    (cid, topic, int(qos), options_json),
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def del_subscription(self, client_id: str, topic: str) -> None:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    "DELETE FROM subscriptions WHERE client_id = ? AND topic = ?;",
+                    (cid, topic),
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def get_subscriptions(
+        self, client_id: str
+    ) -> List[Tuple[str, int, SubscribeOptions | None]]:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            cur = conn.execute(
+                "SELECT topic, qos, options_json FROM subscriptions WHERE client_id = ?;",
+                (cid,),
+            )
+            rows = cur.fetchall()
+        return [
+            (topic, int(qos), self._deserialize_options(options_json))
+            for topic, qos, options_json in rows
+        ]
+
+    def put_last_mid(self, client_id: str, mid: int) -> None:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO last_mid (client_id, mid) VALUES (?, ?)
+                    ON CONFLICT(client_id) DO UPDATE SET mid=excluded.mid;
+                    """,
+                    (cid, int(mid)),
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def get_last_mid(self, client_id: str) -> int:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            cur = conn.execute(
+                "SELECT mid FROM last_mid WHERE client_id = ?;",
+                (cid,),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def clear_session(self, client_id: str) -> None:
+        cid = client_id.decode("utf-8") if isinstance(client_id, bytes) else client_id
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    "DELETE FROM outgoing_messages WHERE client_id = ?;", (cid,)
+                )
+                conn.execute(
+                    "DELETE FROM incoming_messages WHERE client_id = ?;", (cid,)
+                )
+                conn.execute(
+                    "DELETE FROM subscriptions WHERE client_id = ?;", (cid,)
+                )
+                conn.execute("DELETE FROM last_mid WHERE client_id = ?;", (cid,))
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+
+
 class Client:
     """MQTT version 3.1/3.1.1/5.0 client class.
 
@@ -740,6 +1180,7 @@ class Client:
         transport: Literal["tcp", "websockets", "unix"] = "tcp",
         reconnect_on_failure: bool = True,
         manual_ack: bool = False,
+        session_store: SessionStore | None = None,
     ) -> None:
         transport = transport.lower()  # type: ignore
         if transport == "unix" and not hasattr(socket, "AF_UNIX"):
@@ -825,6 +1266,11 @@ class Client:
         self._in_messages: collections.OrderedDict[
             int, MQTTMessage
         ] = collections.OrderedDict()
+        self._session_store: SessionStore | None = session_store
+        # Track subscribed topics in memory so we can persist/replay them
+        self._subscribed_topics: Dict[str, Tuple[int, SubscribeOptions | None]] = {}
+        self._pending_subscribe_topics: list[tuple[str, int, SubscribeOptions | None]] = []
+        self._pending_unsubscribe_topics: list[str] = []
         self._max_inflight_messages = 20
         self._inflight_messages = 0
         self._max_queued_messages = 0
@@ -876,8 +1322,27 @@ class Client:
         self._mqttv5_first_connect = True
         self.suppress_exceptions = False # For callbacks
 
+        # Restore in-memory session state from the configured persistence
+        # layer, if any. When clean_session/clean_start is True, the broker
+        # will discard its own session but the client-side state is still
+        # useful to keep (e.g. the last used mid).
+        if self._session_store is not None:
+            try:
+                self._restore_session()
+            except Exception as err:
+                self._easy_log(
+                    MQTT_LOG_ERR,
+                    "Failed to restore session from session_store: %s",
+                    err,
+                )
+
     def __del__(self) -> None:
         self._reset_sockets()
+        if getattr(self, "_session_store", None) is not None:
+            try:
+                self._session_store.close()
+            except Exception:
+                pass
 
     @property
     def host(self) -> str:
@@ -1580,6 +2045,18 @@ class Client:
             self._last_msg_in = time_func()
             self._last_msg_out = time_func()
 
+        # Reload state from the configured session store so in-flight
+        # messages and subscriptions survive client restarts.
+        if self._session_store is not None:
+            try:
+                self._restore_session()
+            except Exception as err:
+                self._easy_log(
+                    MQTT_LOG_ERR,
+                    "Failed to restore session from session_store: %s",
+                    err,
+                )
+
         # Put messages in progress in a valid state.
         self._messages_reconnect_reset()
 
@@ -1794,6 +2271,8 @@ class Client:
                     return message.info
 
                 self._out_messages[message.mid] = message
+                # Persist the new message so it survives connection loss
+                self._persist_outgoing(message)
                 if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
                     self._inflight_messages += 1
                     if qos == 1:
@@ -1885,11 +2364,16 @@ class Client:
         """
         if self._sock is None:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTED
+            # Persist even if the socket is already gone so the state survives
+            # process restarts.
+            self._persist_session()
             return MQTT_ERR_NO_CONN
         else:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTING
 
-        return self._send_disconnect(reasoncode, properties)
+        rc = self._send_disconnect(reasoncode, properties)
+        self._persist_session()
+        return rc
 
     def subscribe(
         self,
@@ -2032,6 +2516,17 @@ class Client:
         if any(self._filter_wildcard_len_check(topic) != MQTT_ERR_SUCCESS for topic, _ in topic_qos_list):
             raise ValueError('Invalid subscription filter.')
 
+        # Convert topic_qos_list to a dict of {mid: [(topic_str, qos_or_options)]}
+        # for later confirmation in _handle_suback. We need to return a mid value.
+        pending_subs: list[tuple[str, int, SubscribeOptions | None]] = []
+        for t, o_or_q in topic_qos_list:
+            t_str = t.decode('utf-8') if isinstance(t, (bytes, bytearray)) else str(t)
+            if isinstance(o_or_q, SubscribeOptions):
+                pending_subs.append((t_str, o_or_q.qos, o_or_q))
+            else:
+                pending_subs.append((t_str, int(o_or_q), None))
+        self._pending_subscribe_topics = pending_subs
+
         if self._sock is None:
             return (MQTT_ERR_NO_CONN, None)
 
@@ -2073,6 +2568,12 @@ class Client:
 
         if topic_list is None:
             raise ValueError("No topic specified, or incorrect topic type.")
+
+        pending_unsubs: list[str] = []
+        for t in topic_list:
+            t_str = t.decode('utf-8') if isinstance(t, (bytes, bytearray)) else str(t)
+            pending_unsubs.append(t_str)
+        self._pending_unsubscribe_topics = pending_unsubs
 
         if self._sock is None:
             return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
@@ -3301,6 +3802,8 @@ class Client:
             self._last_mid += 1
             if self._last_mid == 65536:
                 self._last_mid = 1
+            # Persist the new mid so we don't reuse ids after a restart
+            self._persist_last_mid()
             return self._last_mid
 
     @staticmethod
@@ -3755,6 +4258,156 @@ class Client:
         self._messages_reconnect_reset_out()
         self._messages_reconnect_reset_in()
 
+    def _restore_session(self) -> None:
+        """Restore in-memory session state from the configured session
+        store. Called from ``__init__`` and from ``reconnect``."""
+        store = self._session_store
+        if store is None:
+            return
+        cid = self._client_id
+
+        stored_mid = store.get_last_mid(cid)
+        if stored_mid > self._last_mid:
+            self._last_mid = stored_mid
+
+        outgoing = store.get_outgoing_messages(cid)
+        with self._out_message_mutex:
+            for mid, msg in outgoing.items():
+                if mid not in self._out_messages:
+                    self._out_messages[mid] = msg
+                    if msg.qos > 0 and self._inflight_messages < self._max_inflight_messages:
+                        self._inflight_messages += 1
+
+        incoming = store.get_incoming_messages(cid)
+        with self._in_message_mutex:
+            for mid, msg in incoming.items():
+                if mid not in self._in_messages:
+                    self._in_messages[mid] = msg
+
+        subs = store.get_subscriptions(cid)
+        for topic, qos, options in subs:
+            self._subscribed_topics[topic] = (qos, options)
+
+    def _persist_outgoing(self, message: MQTTMessage) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.put_outgoing_message(self._client_id, message)
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Failed to persist outgoing message: %s", err
+            )
+
+    def _remove_outgoing(self, mid: int) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.del_outgoing_message(self._client_id, mid)
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Failed to delete outgoing message: %s", err
+            )
+
+    def _persist_incoming(self, message: MQTTMessage) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.put_incoming_message(self._client_id, message)
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Failed to persist incoming message: %s", err
+            )
+
+    def _remove_incoming(self, mid: int) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.del_incoming_message(self._client_id, mid)
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Failed to delete incoming message: %s", err
+            )
+
+    def _persist_subscription(
+        self, topic: str, qos: int, options: SubscribeOptions | None = None
+    ) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.put_subscription(self._client_id, topic, qos, options)
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Failed to persist subscription: %s", err
+            )
+
+    def _remove_subscription(self, topic: str) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.del_subscription(self._client_id, topic)
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Failed to delete subscription: %s", err
+            )
+
+    def _persist_last_mid(self) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.put_last_mid(self._client_id, self._last_mid)
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Failed to persist last mid: %s", err
+            )
+
+    def _persist_session(self) -> None:
+        """Flush all current in-memory session state to the session store.
+        Called from ``disconnect`` and from ``reinitialise`` cleanup paths."""
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            cid = self._client_id
+            with self._out_message_mutex:
+                for msg in self._out_messages.values():
+                    store.put_outgoing_message(cid, msg)
+            with self._in_message_mutex:
+                for msg in self._in_messages.values():
+                    store.put_incoming_message(cid, msg)
+            for topic, (qos, options) in self._subscribed_topics.items():
+                store.put_subscription(cid, topic, qos, options)
+            store.put_last_mid(cid, self._last_mid)
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Failed to persist session state: %s", err
+            )
+
+    def session_store(self) -> SessionStore | None:
+        """Return the configured :class:`SessionStore` (or ``None``)."""
+        return self._session_store
+
+    def set_session_store(self, session_store: SessionStore | None) -> None:
+        """Replace the configured :class:`SessionStore`. If a non-``None``
+        value is passed, the current in-memory state will be loaded from it
+        immediately (equivalent to what ``__init__`` does)."""
+        self._session_store = session_store
+        if session_store is not None:
+            try:
+                self._restore_session()
+            except Exception as err:
+                self._easy_log(
+                    MQTT_LOG_ERR,
+                    "Failed to restore session from new session_store: %s",
+                    err,
+                )
+
     def _packet_queue(
         self,
         command: int,
@@ -4053,6 +4706,25 @@ class Client:
             reasoncodes = [ReasonCode(SUBACK >> 4, identifier=c) for c in granted_qos]
             properties = Properties(SUBACK >> 4)
 
+        # Persist confirmed subscriptions. We match the list of pending topics
+        # 1-to-1 with the returned reason codes by position. Any code that is
+        # not a failure (0x80+) means the subscription was accepted.
+        pending = getattr(self, "_pending_subscribe_topics", None)
+        if pending:
+            for i, (t, qos, opts) in enumerate(pending):
+                try:
+                    rc_code = reasoncodes[i]
+                    granted = rc_code.value if isinstance(rc_code, ReasonCode) else int(rc_code)
+                    if granted < 0x80:  # accepted
+                        self._subscribed_topics[t] = (qos, opts)
+                        self._persist_subscription(t, qos, opts)
+                except (IndexError, TypeError, AttributeError):
+                    # Fall back to assuming success if the reason code cannot
+                    # be parsed - best-effort persistence.
+                    self._subscribed_topics[t] = (qos, opts)
+                    self._persist_subscription(t, qos, opts)
+            self._pending_subscribe_topics: list[tuple[str, int, SubscribeOptions | None]] = []
+
         with self._callback_mutex:
             on_subscribe = self.on_subscribe
 
@@ -4157,6 +4829,7 @@ class Client:
             message.state = mqtt_ms_wait_for_pubrel
             with self._in_message_mutex:
                 self._in_messages[message.mid] = message
+            self._persist_incoming(message)
 
             return rc
         else:
@@ -4207,6 +4880,7 @@ class Client:
                 # Only pass the message on if we have removed it from the queue - this
                 # prevents multiple callbacks for the same message.
                 message = self._in_messages.pop(mid)
+                self._remove_incoming(mid)
                 self._handle_on_message(message)
                 self._inflight_messages -= 1
                 if self._max_inflight_messages > 0:
@@ -4274,6 +4948,7 @@ class Client:
                 msg = self._out_messages[mid]
                 msg.state = mqtt_ms_wait_for_pubcomp
                 msg.timestamp = time_func()
+                self._persist_outgoing(msg)
                 return self._send_pubrel(mid)
 
         return MQTTErrorCode.MQTT_ERR_SUCCESS
@@ -4299,6 +4974,16 @@ class Client:
             properties = Properties(UNSUBACK >> 4)
 
         self._easy_log(MQTT_LOG_DEBUG, "Received UNSUBACK (Mid: %d)", mid)
+
+        # Remove unsubscribed topics from in-memory tracking and from the
+        # session store.
+        pending_unsubs = getattr(self, "_pending_unsubscribe_topics", None)
+        if pending_unsubs:
+            for t in pending_unsubs:
+                self._subscribed_topics.pop(t, None)
+                self._remove_subscription(t)
+            self._pending_unsubscribe_topics: list[str] = []
+
         with self._callback_mutex:
             on_unsubscribe = self.on_unsubscribe
 
@@ -4425,6 +5110,7 @@ class Client:
                         raise
 
         msg = self._out_messages.pop(mid)
+        self._remove_outgoing(mid)
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1

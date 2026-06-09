@@ -41,6 +41,7 @@ from paho.mqtt.packettypes import PacketTypes
 
 from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
 from .matcher import MQTTMatcher
+from .metrics import PahoMetrics
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
@@ -872,9 +873,12 @@ class Client:
         self._on_socket_unregister_write: CallbackOnSocket | None = None
         self._websocket_path = "/mqtt"
         self._websocket_extra_headers: WebSocketHeaders | None = None
-        # for clean_start == MQTT_CLEAN_START_FIRST_ONLY
+        # for clean_start == MQTT_CLEAN_START_FIRST_ONly
         self._mqttv5_first_connect = True
         self.suppress_exceptions = False # For callbacks
+
+        client_id_str = self._client_id.decode("utf-8") if self._client_id else ""
+        self.metrics: PahoMetrics = PahoMetrics(client_id_str)
 
     def __del__(self) -> None:
         self._reset_sockets()
@@ -1094,7 +1098,9 @@ class Client:
         if self._sock is None:
             raise ConnectionError("self._sock is None")
         try:
-            return self._sock.recv(bufsize)
+            data = self._sock.recv(bufsize)
+            self.metrics.record_bytes_received(len(data))
+            return data
         except ssl.SSLWantReadError as err:
             raise BlockingIOError() from err
         except ssl.SSLWantWriteError as err:
@@ -1110,7 +1116,9 @@ class Client:
             raise ConnectionError("self._sock is None")
 
         try:
-            return self._sock.send(buf)
+            sent = self._sock.send(buf)
+            self.metrics.record_bytes_sent(sent)
+            return sent
         except ssl.SSLWantReadError as err:
             raise BlockingIOError() from err
         except ssl.SSLWantWriteError as err:
@@ -1551,6 +1559,8 @@ class Client:
         if self._port <= 0:
             raise ValueError('Invalid port number.')
 
+        self.metrics.record_reconnect()
+
         self._in_packet = {
             "command": 0,
             "have_remaining": 0,
@@ -1670,12 +1680,14 @@ class Client:
             # mqtt_cs_disconnecting.
             if self._state not in (_ConnectionState.MQTT_CS_DISCONNECTING, _ConnectionState.MQTT_CS_DISCONNECTED):
                 self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+                self.metrics.record_connection_lost()
             return MQTTErrorCode.MQTT_ERR_CONN_LOST
         except ValueError:
             # Can occur if we just reconnected but rlist/wlist contain a -1 for
             # some reason.
             if self._state not in (_ConnectionState.MQTT_CS_DISCONNECTING, _ConnectionState.MQTT_CS_DISCONNECTED):
                 self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+                self.metrics.record_connection_lost()
             return MQTTErrorCode.MQTT_ERR_CONN_LOST
         except Exception:
             # Note that KeyboardInterrupt, etc. can still terminate since they
@@ -1774,6 +1786,7 @@ class Client:
             rc = self._send_publish(
                 local_mid, topic_bytes, local_payload, qos, retain, False, info, properties)
             info.rc = rc
+            self.metrics.record_publish(qos, len(local_payload))
             return info
         else:
             message = MQTTMessage(local_mid, topic_bytes)
@@ -1810,10 +1823,16 @@ class Client:
                         message.state = mqtt_ms_publish
 
                     message.info.rc = rc
+                    self.metrics.record_publish(qos, len(local_payload))
+                    self.metrics.track_publish_start(message.mid)
+                    self.metrics.set_inflight(self._inflight_messages)
                     return message.info
                 else:
                     message.state = mqtt_ms_queued
                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+                    self.metrics.record_publish(qos, len(local_payload))
+                    self.metrics.track_publish_start(message.mid)
+                    self.metrics.set_inflight(self._inflight_messages)
                     return message.info
 
     def username_pw_set(
@@ -3886,11 +3905,13 @@ class Client:
                     flags, result,
                 )
                 self._client_id = _base62(uuid.uuid4().int, padding=22).encode("utf8")
+                self.metrics.client_id = self._client_id.decode("utf-8")
                 return self.reconnect()
 
         if result == 0:
             self._state = _ConnectionState.MQTT_CS_CONNECTED
             self._reconnect_delay = None
+            self.metrics.record_connect(True)
 
         if self._protocol == MQTTv5:
             self._easy_log(
@@ -4011,8 +4032,10 @@ class Client:
 
             return rc
         elif result > 0 and result < 6:
+            self.metrics.record_connect(False)
             return MQTTErrorCode.MQTT_ERR_CONN_REFUSED
         else:
+            self.metrics.record_connect(False)
             return MQTTErrorCode.MQTT_ERR_PROTOCOL
 
     def _handle_disconnect(self) -> None:
@@ -4124,6 +4147,8 @@ class Client:
             packet = packet[props_len:]
 
         message.payload = packet
+
+        self.metrics.record_message_received(message.qos, len(message.payload))
 
         if self._protocol == MQTTv5:
             self._easy_log(
@@ -4349,6 +4374,8 @@ class Client:
         reason: ReasonCode | None = None,
         properties: Properties | None = None,
     ) -> None:
+        self.metrics.record_disconnect()
+
         with self._callback_mutex:
             on_disconnect = self.on_disconnect
 
@@ -4426,8 +4453,11 @@ class Client:
 
         msg = self._out_messages.pop(mid)
         msg.info._set_as_published()
+        self.metrics.record_publish_ack(msg.qos)
+        self.metrics.record_publish_complete(mid, msg.qos)
         if msg.qos > 0:
             self._inflight_messages -= 1
+            self.metrics.set_inflight(self._inflight_messages)
             if self._max_inflight_messages > 0:
                 rc = self._update_inflight()
                 if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
@@ -4507,6 +4537,8 @@ class Client:
 
 
     def _handle_on_connect_fail(self) -> None:
+        self.metrics.record_connect(False)
+
         with self._callback_mutex:
             on_connect_fail = self.on_connect_fail
 

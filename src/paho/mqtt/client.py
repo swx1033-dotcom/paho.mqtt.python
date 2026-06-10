@@ -854,7 +854,8 @@ class Client:
         self._ssl_context: ssl.SSLContext | None = None
         # Only used when SSL context does not have check_hostname attribute
         self._tls_insecure = False
-        self._logger: logging.Logger | None = None
+        client_id_str = self._client_id.decode('utf-8', 'replace') if isinstance(self._client_id, bytes) else str(self._client_id)
+        self._logger: logging.LoggerAdapter | None = logging.LoggerAdapter(logging.getLogger('paho.mqtt'), {'client_id': client_id_str})
         self._registered_write = False
         # No default callbacks
         self._on_log: CallbackOnLog | None = None
@@ -1084,11 +1085,15 @@ class Client:
 
     @property
     def logger(self) -> logging.Logger | None:
-        return self._logger
+        return self._logger.logger if self._logger else None
 
     @logger.setter
     def logger(self, value: logging.Logger | None) -> None:
-        self._logger = value
+        if value is None:
+            self._logger = None
+        else:
+            client_id_str = self._client_id.decode('utf-8', 'replace') if isinstance(self._client_id, bytes) else str(self._client_id)
+            self._logger = logging.LoggerAdapter(value, {'client_id': client_id_str})
 
     def _sock_recv(self, bufsize: int) -> bytes:
         if self._sock is None:
@@ -1378,17 +1383,19 @@ class Client:
         See `disable_logger` to undo this action.
         """
         if logger is None:
-            if self._logger is not None:
-                # Do not replace existing logger
-                return
-            logger = logging.getLogger(__name__)
+            logger = logging.getLogger('paho.mqtt')
+            if not logger.hasHandlers():
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(client_id)s] %(message)s')
+                handler.setFormatter(formatter)
+                logger.addHandler(handler)
         self.logger = logger
 
     def disable_logger(self) -> None:
         """
-        Disable logging using standard python logging package. This has no effect on the `on_log` callback.
+        Disable logging using standard python logging package.
         """
-        self._logger = None
+        self.logger = None
 
     def connect(
         self,
@@ -2398,6 +2405,7 @@ class Client:
 
     @on_log.setter
     def on_log(self, func: CallbackOnLog | None) -> None:
+        warnings.warn("on_log callback is deprecated, use standard logging instead", DeprecationWarning, stacklevel=2)
         self._on_log = func
 
     def log_callback(self) -> Callable[[CallbackOnLog], CallbackOnLog]:
@@ -3247,15 +3255,9 @@ class Client:
         return MQTTErrorCode.MQTT_ERR_SUCCESS
 
     def _easy_log(self, level: LogLevel, fmt: str, *args: Any) -> None:
-        if self.on_log is not None:
-            buf = fmt % args
-            try:
-                self.on_log(self, self._userdata, level, buf)
-            except Exception:  # noqa: S110
-                # Can't _easy_log this, as we'll recurse until we break
-                pass  # self._logger will pick this up, so we're fine
+        """Deprecated internal log method. Use self.logger directly."""
+        level_std = LOGGING_LEVEL[level]
         if self._logger is not None:
-            level_std = LOGGING_LEVEL[level]
             self._logger.log(level_std, fmt, *args)
 
     def _check_keepalive(self) -> None:

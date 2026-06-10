@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 import unicodedata
@@ -13,6 +14,59 @@ import tests.paho_test as paho_test
 
 # Import test fixture
 from tests.testsupport.broker import FakeBroker, fake_broker  # noqa: F401
+
+
+class Test_logging:
+    def test_logs_use_standard_logger_with_client_id_context(self, caplog):
+        mqttc = client.Client(CallbackAPIVersion.VERSION2, "test-client")
+
+        with caplog.at_level(logging.DEBUG, logger="paho.mqtt"):
+            mqttc._log(client.MQTT_LOG_DEBUG, "debug message %s", "value")
+
+        record = caplog.records[-1]
+        assert record.name == "paho.mqtt"
+        assert record.client_id == "test-client"
+        assert record.getMessage() == "debug message value"
+
+    def test_enable_logger_adds_stream_handler_to_non_propagating_logger(self):
+        mqttc = client.Client(CallbackAPIVersion.VERSION2, "test-client")
+        logger = logging.getLogger("tests.paho.enable_logger")
+        previous_handlers = list(logger.handlers)
+        previous_propagate = logger.propagate
+
+        try:
+            for handler in previous_handlers:
+                logger.removeHandler(handler)
+            logger.propagate = False
+
+            mqttc.enable_logger(logger)
+
+            assert mqttc.logger is logger
+            assert any(isinstance(handler, logging.StreamHandler) for handler in logger.handlers)
+        finally:
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                handler.close()
+            logger.propagate = previous_propagate
+            for handler in previous_handlers:
+                logger.addHandler(handler)
+
+    def test_on_log_is_deprecated_and_unused(self, caplog):
+        mqttc = client.Client(CallbackAPIVersion.VERSION2, "test-client")
+        log_calls = []
+
+        def on_log(client_instance, userdata, level, buf):
+            log_calls.append((client_instance, userdata, level, buf))
+
+        with pytest.deprecated_call(match="Client.on_log"):
+            mqttc.on_log = on_log
+
+        with caplog.at_level(logging.DEBUG, logger="paho.mqtt"):
+            mqttc._log(client.MQTT_LOG_DEBUG, "deprecated callback test")
+
+        assert log_calls == []
+        assert caplog.records[-1].client_id == "test-client"
+        assert caplog.records[-1].getMessage() == "deprecated callback test"
 
 
 @pytest.mark.parametrize("proto_ver,callback_version", [

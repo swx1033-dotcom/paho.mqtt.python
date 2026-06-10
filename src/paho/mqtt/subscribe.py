@@ -28,11 +28,13 @@ def _on_connect(client, userdata, flags, reason_code, properties):
     if reason_code != 0:
         raise mqtt.MQTTException(paho.connack_string(reason_code))
 
+    user_props = userdata.get('user_properties')
+
     if isinstance(userdata['topics'], list):
         for topic in userdata['topics']:
-            client.subscribe(topic, userdata['qos'])
+            client.subscribe(topic, userdata['qos'], user_properties=user_props)
     else:
-        client.subscribe(userdata['topics'], userdata['qos'])
+        client.subscribe(userdata['topics'], userdata['qos'], user_properties=user_props)
 
 
 def _on_message_callback(client, userdata, message):
@@ -65,7 +67,7 @@ def _on_message_simple(client, userdata, message):
 def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
              port=1883, client_id="", keepalive=60, will=None, auth=None,
              tls=None, protocol=paho.MQTTv311, transport="tcp",
-             clean_session=True, proxy_args=None):
+             clean_session=True, proxy_args=None, user_properties=None):
     """Subscribe to a list of topics and process them in a callback function.
 
     This function creates an MQTT client, connects to a broker and subscribes
@@ -128,6 +130,10 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
                     Defaults to True.
 
     :param proxy_args: a dictionary that will be given to the client.
+
+    :param dict user_properties: (MQTT v5.0 only) A dict of key-value string pairs to set as
+           MQTT v5.0 user properties. This is a convenience alternative to manually
+           creating a Properties object. Requires protocol to be set to MQTTv5.
     """
 
     if qos < 0 or qos > 2:
@@ -137,7 +143,8 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
         'callback':callback,
         'topics':topics,
         'qos':qos,
-        'userdata':userdata}
+        'userdata':userdata,
+        'user_properties':user_properties}
 
     client = paho.Client(
         paho.CallbackAPIVersion.VERSION2,
@@ -186,7 +193,7 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
 def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
            port=1883, client_id="", keepalive=60, will=None, auth=None,
            tls=None, protocol=paho.MQTTv311, transport="tcp",
-           clean_session=True, proxy_args=None):
+           clean_session=True, proxy_args=None, user_properties=None):
     """Subscribe to a list of topics and return msg_count messages.
 
     This function creates an MQTT client, connects to a broker and subscribes
@@ -256,6 +263,10 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
                     is ignored.
 
     :param proxy_args: a dictionary that will be given to the client.
+
+    :param dict user_properties: (MQTT v5.0 only) A dict of key-value string pairs to set as
+           MQTT v5.0 user properties. This is a convenience alternative to manually
+           creating a Properties object. Requires protocol to be set to MQTTv5.
     """
 
     if msg_count < 1:
@@ -276,6 +287,6 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
 
     callback(_on_message_simple, topics, qos, userdata, hostname, port,
              client_id, keepalive, will, auth, tls, protocol, transport,
-             clean_session, proxy_args)
+             clean_session, proxy_args, user_properties)
 
     return userdata['messages']

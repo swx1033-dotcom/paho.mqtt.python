@@ -419,3 +419,43 @@ class Properties:
                     f"Property '{property}' must not exist more than once")
             setattr(self, propname, value)
         return self, propslen + VBIlen
+
+
+def properties_from_user_properties(
+    user_properties: dict[str, str],
+    packetType: int,
+    properties: Properties | None = None,
+) -> Properties:
+    """Create or update a Properties object from a user_properties dict.
+
+    This is a convenience function to simplify setting MQTT v5.0 user properties.
+    Instead of manually creating a Properties object and setting UserProperty
+    attributes one by one, you can pass a dict of key-value pairs.
+
+    If an existing Properties object is provided via the `properties` parameter,
+    the user properties will be merged into it. Otherwise, a new Properties
+    object will be created.
+
+    Example of use::
+
+        # Create new Properties from dict
+        props = properties_from_user_properties({"key1": "val1", "key2": "val2"}, PacketTypes.PUBLISH)
+
+        # Merge into existing Properties
+        existing_props = Properties(PacketTypes.PUBLISH)
+        existing_props.MessageExpiryInterval = 30
+        props = properties_from_user_properties({"key1": "val1"}, PacketTypes.PUBLISH, existing_props)
+
+    :param user_properties: A dict of key-value string pairs to set as UserProperty.
+    :param packetType: The MQTT packet type (e.g. PacketTypes.PUBLISH).
+    :param properties: An optional existing Properties object to merge into.
+        If None, a new Properties object is created.
+    :return: A Properties object with the user properties set.
+    """
+    if properties is None:
+        properties = Properties(packetType)
+
+    for key, value in user_properties.items():
+        properties.UserProperty = (key, value)
+
+    return properties

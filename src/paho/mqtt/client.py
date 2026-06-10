@@ -41,7 +41,7 @@ from paho.mqtt.packettypes import PacketTypes
 
 from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
 from .matcher import MQTTMatcher
-from .properties import Properties
+from .properties import Properties, properties_from_user_properties
 from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
 
@@ -1713,6 +1713,7 @@ class Client:
         qos: int = 0,
         retain: bool = False,
         properties: Properties | None = None,
+        user_properties: dict[str, str] | None = None,
     ) -> MQTTMessageInfo:
         """Publish a message on a topic.
 
@@ -1729,6 +1730,10 @@ class Client:
         :param bool retain: If set to true, the message will be set as the "last known
             good"/retained message for the topic.
         :param Properties properties: (MQTT v5.0 only) the MQTT v5.0 properties to be included.
+        :param dict user_properties: (MQTT v5.0 only) A dict of key-value string pairs to set as
+            MQTT v5.0 user properties. If both `properties` and `user_properties` are provided,
+            the user properties will be merged into the existing `properties` object.
+            This is a convenience alternative to manually creating a Properties object.
 
         Returns a `MQTTMessageInfo` class, which can be used to determine whether
         the message has been delivered (using `is_published()`) or to block
@@ -1751,6 +1756,11 @@ class Client:
         :raises ValueError: if qos is not one of 0, 1 or 2
         :raises ValueError: if the length of the payload is greater than 268435455 bytes.
         """
+        if user_properties is not None:
+            properties = properties_from_user_properties(
+                user_properties, PacketTypes.PUBLISH, properties
+            )
+
         if self._protocol != MQTTv5:
             if topic is None or len(topic) == 0:
                 raise ValueError('Invalid topic.')
@@ -1897,6 +1907,7 @@ class Client:
         qos: int = 0,
         options: SubscribeOptions | None = None,
         properties: Properties | None = None,
+        user_properties: dict[str, str] | None = None,
     ) -> tuple[MQTTErrorCode, int | None]:
         """Subscribe the client to one or more topics.
 
@@ -1966,6 +1977,10 @@ class Client:
         :qos and options: Not used.
         :properties: a Properties instance setting the MQTT v5.0 properties
             to be included. Optional - if not set, no properties are sent.
+        :user_properties: (MQTT v5.0 only) A dict of key-value string pairs to set as
+            MQTT v5.0 user properties. If both `properties` and `user_properties` are provided,
+            the user properties will be merged into the existing `properties` object.
+            This is a convenience alternative to manually creating a Properties object.
 
         The function returns a tuple (result, mid), where result is
         MQTT_ERR_SUCCESS to indicate success or (MQTT_ERR_NO_CONN, None) if the
@@ -1977,6 +1992,11 @@ class Client:
         Raises a ValueError if qos is not 0, 1 or 2, or if topic is None or has
         zero string length, or if topic is not a string, tuple or list.
         """
+        if user_properties is not None:
+            properties = properties_from_user_properties(
+                user_properties, PacketTypes.SUBSCRIBE, properties
+            )
+
         topic_qos_list = None
 
         if isinstance(topic, tuple):

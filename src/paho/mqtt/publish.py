@@ -63,6 +63,8 @@ if TYPE_CHECKING:
         payload: NotRequired[paho.PayloadType]
         qos: NotRequired[int]
         retain: NotRequired[bool]
+        properties: NotRequired[Properties]
+        user_properties: NotRequired[dict[str, Any]]
 
     MessageTuple = Tuple[str, paho.PayloadType, int, bool]
 
@@ -103,6 +105,25 @@ def _on_publish(
         _do_publish(client)
 
 
+def _normalize_message(message: MessageDict | MessageTuple, user_properties: dict[str, Any] | None):
+    if isinstance(message, dict):
+        normalized_message = dict(message)
+        if user_properties is not None and 'user_properties' not in normalized_message:
+            normalized_message['user_properties'] = user_properties
+        return normalized_message
+
+    if isinstance(message, (tuple, list)):
+        if user_properties is None:
+            return message
+        if len(message) > 5:
+            raise TypeError('message must be a dict, tuple, or list')
+        normalized_message = dict(zip(('topic', 'payload', 'qos', 'retain', 'properties'), message))
+        normalized_message['user_properties'] = user_properties
+        return normalized_message
+
+    raise TypeError('message must be a dict, tuple, or list')
+
+
 def multiple(
     msgs: MessagesList,
     hostname: str = "localhost",
@@ -115,6 +136,7 @@ def multiple(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    user_properties: dict[str, Any] | None = None,
 ) -> None:
     """Publish multiple messages to a broker, then disconnect cleanly.
 
@@ -177,6 +199,9 @@ def multiple(
           raw TCP. Set to "websockets" to use WebSockets as the transport.
 
     :param proxy_args: a dictionary that will be given to the client.
+
+    :param dict user_properties: (MQTT v5.0 only) user properties to merge into
+           each publish call automatically.
     """
 
     if not isinstance(msgs, Iterable):
@@ -184,10 +209,12 @@ def multiple(
     if len(msgs) == 0:
         raise ValueError('msgs is empty')
 
+    normalized_msgs = [_normalize_message(message, user_properties) for message in msgs]
+
     client = paho.Client(
         CallbackAPIVersion.VERSION2,
         client_id=client_id,
-        userdata=collections.deque(msgs),
+        userdata=collections.deque(normalized_msgs),
         protocol=protocol,
         transport=transport,
     )
@@ -243,6 +270,7 @@ def single(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    user_properties: dict[str, Any] | None = None,
 ) -> None:
     """Publish a single message to a broker, then disconnect cleanly.
 
@@ -298,9 +326,14 @@ def single(
           raw TCP. Set to "websockets" to use WebSockets as the transport.
 
     :param proxy_args: a dictionary that will be given to the client.
+
+    :param dict user_properties: (MQTT v5.0 only) user properties to merge into
+           the publish properties automatically.
     """
 
     msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
+    if user_properties is not None:
+        msg['user_properties'] = user_properties
 
     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
              protocol, transport, proxy_args)

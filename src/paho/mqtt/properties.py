@@ -15,6 +15,7 @@
 # *******************************************************************
 
 import struct
+from collections.abc import Mapping
 
 from .packettypes import PacketTypes
 
@@ -247,6 +248,42 @@ class Properties:
                 result = self.names[name]
                 break
         return result
+
+    def copy(self):
+        properties = type(self)(self.packetType)
+        for name in self.names.keys():
+            compressedName = name.replace(' ', '')
+            if hasattr(self, compressedName):
+                value = getattr(self, compressedName)
+                if isinstance(value, list):
+                    value = list(value)
+                object.__setattr__(properties, compressedName, value)
+        return properties
+
+    def add_user_properties(self, user_properties):
+        if user_properties is None:
+            return self
+        if not isinstance(user_properties, Mapping):
+            raise TypeError("user_properties must be a mapping")
+        for key, value in user_properties.items():
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    self.UserProperty = (key, item)
+            else:
+                self.UserProperty = (key, value)
+        return self
+
+    @classmethod
+    def with_user_properties(cls, packetType, properties=None, user_properties=None):
+        if user_properties is None:
+            return properties
+        if properties is None:
+            properties = cls(packetType)
+        elif not isinstance(properties, cls):
+            raise TypeError("properties must be an instance of Properties")
+        else:
+            properties = properties.copy()
+        return properties.add_user_properties(user_properties)
 
     def __setattr__(self, name, value):
         name = name.replace(' ', '')

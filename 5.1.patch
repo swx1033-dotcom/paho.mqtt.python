@@ -1,0 +1,510 @@
+diff --git a/src/paho/mqtt/client.py b/src/paho/mqtt/client.py
+index 4ccc869..7fdd818 100644
+--- a/src/paho/mqtt/client.py
++++ b/src/paho/mqtt/client.py
+@@ -1713,6 +1713,7 @@ class Client:
+         qos: int = 0,
+         retain: bool = False,
+         properties: Properties | None = None,
++        user_properties: dict[str, Any] | None = None,
+     ) -> MQTTMessageInfo:
+         """Publish a message on a topic.
+ 
+@@ -1729,6 +1730,8 @@ class Client:
+         :param bool retain: If set to true, the message will be set as the "last known
+             good"/retained message for the topic.
+         :param Properties properties: (MQTT v5.0 only) the MQTT v5.0 properties to be included.
++        :param dict user_properties: (MQTT v5.0 only) user properties to merge into the
++            publish properties automatically.
+ 
+         Returns a `MQTTMessageInfo` class, which can be used to determine whether
+         the message has been delivered (using `is_published()`) or to block
+@@ -1768,6 +1771,7 @@ class Client:
+             raise ValueError('Payload too large.')
+ 
+         local_mid = self._mid_generate()
++        properties = Properties.with_user_properties(PacketTypes.PUBLISH, properties, user_properties)
+ 
+         if qos == 0:
+             info = MQTTMessageInfo(local_mid)
+@@ -1897,6 +1901,7 @@ class Client:
+         qos: int = 0,
+         options: SubscribeOptions | None = None,
+         properties: Properties | None = None,
++        user_properties: dict[str, Any] | None = None,
+     ) -> tuple[MQTTErrorCode, int | None]:
+         """Subscribe the client to one or more topics.
+ 
+@@ -1967,6 +1972,9 @@ class Client:
+         :properties: a Properties instance setting the MQTT v5.0 properties
+             to be included. Optional - if not set, no properties are sent.
+ 
++        :param dict user_properties: (MQTT v5.0 only) user properties to merge into the
++            subscribe properties automatically.
++
+         The function returns a tuple (result, mid), where result is
+         MQTT_ERR_SUCCESS to indicate success or (MQTT_ERR_NO_CONN, None) if the
+         client is not currently connected.  mid is the message ID for the
+@@ -2035,6 +2043,8 @@ class Client:
+         if self._sock is None:
+             return (MQTT_ERR_NO_CONN, None)
+ 
++        properties = Properties.with_user_properties(PacketTypes.SUBSCRIBE, properties, user_properties)
++
+         return self._send_subscribe(False, topic_qos_list, properties)
+ 
+     def unsubscribe(
+diff --git a/src/paho/mqtt/properties.py b/src/paho/mqtt/properties.py
+index f307b86..692ff54 100644
+--- a/src/paho/mqtt/properties.py
++++ b/src/paho/mqtt/properties.py
+@@ -15,6 +15,7 @@
+ # *******************************************************************
+ 
+ import struct
++from collections.abc import Mapping
+ 
+ from .packettypes import PacketTypes
+ 
+@@ -248,6 +249,42 @@ class Properties:
+                 break
+         return result
+ 
++    def copy(self):
++        properties = type(self)(self.packetType)
++        for name in self.names.keys():
++            compressedName = name.replace(' ', '')
++            if hasattr(self, compressedName):
++                value = getattr(self, compressedName)
++                if isinstance(value, list):
++                    value = list(value)
++                object.__setattr__(properties, compressedName, value)
++        return properties
++
++    def add_user_properties(self, user_properties):
++        if user_properties is None:
++            return self
++        if not isinstance(user_properties, Mapping):
++            raise TypeError("user_properties must be a mapping")
++        for key, value in user_properties.items():
++            if isinstance(value, (list, tuple)):
++                for item in value:
++                    self.UserProperty = (key, item)
++            else:
++                self.UserProperty = (key, value)
++        return self
++
++    @classmethod
++    def with_user_properties(cls, packetType, properties=None, user_properties=None):
++        if user_properties is None:
++            return properties
++        if properties is None:
++            properties = cls(packetType)
++        elif not isinstance(properties, cls):
++            raise TypeError("properties must be an instance of Properties")
++        else:
++            properties = properties.copy()
++        return properties.add_user_properties(user_properties)
++
+     def __setattr__(self, name, value):
+         name = name.replace(' ', '')
+         privateVars = ["packetType", "types", "names", "properties"]
+diff --git a/src/paho/mqtt/publish.py b/src/paho/mqtt/publish.py
+index 333c190..6500388 100644
+--- a/src/paho/mqtt/publish.py
++++ b/src/paho/mqtt/publish.py
+@@ -63,6 +63,8 @@ if TYPE_CHECKING:
+         payload: NotRequired[paho.PayloadType]
+         qos: NotRequired[int]
+         retain: NotRequired[bool]
++        properties: NotRequired[Properties]
++        user_properties: NotRequired[dict[str, Any]]
+ 
+     MessageTuple = Tuple[str, paho.PayloadType, int, bool]
+ 
+@@ -103,6 +105,25 @@ def _on_publish(
+         _do_publish(client)
+ 
+ 
++def _normalize_message(message: MessageDict | MessageTuple, user_properties: dict[str, Any] | None):
++    if isinstance(message, dict):
++        normalized_message = dict(message)
++        if user_properties is not None and 'user_properties' not in normalized_message:
++            normalized_message['user_properties'] = user_properties
++        return normalized_message
++
++    if isinstance(message, (tuple, list)):
++        if user_properties is None:
++            return message
++        if len(message) > 5:
++            raise TypeError('message must be a dict, tuple, or list')
++        normalized_message = dict(zip(('topic', 'payload', 'qos', 'retain', 'properties'), message))
++        normalized_message['user_properties'] = user_properties
++        return normalized_message
++
++    raise TypeError('message must be a dict, tuple, or list')
++
++
+ def multiple(
+     msgs: MessagesList,
+     hostname: str = "localhost",
+@@ -115,6 +136,7 @@ def multiple(
+     protocol: MQTTProtocolVersion = paho.MQTTv311,
+     transport: Literal["tcp", "websockets"] = "tcp",
+     proxy_args: Any | None = None,
++    user_properties: dict[str, Any] | None = None,
+ ) -> None:
+     """Publish multiple messages to a broker, then disconnect cleanly.
+ 
+@@ -177,6 +199,9 @@ def multiple(
+           raw TCP. Set to "websockets" to use WebSockets as the transport.
+ 
+     :param proxy_args: a dictionary that will be given to the client.
++
++    :param dict user_properties: (MQTT v5.0 only) user properties to merge into
++           each publish call automatically.
+     """
+ 
+     if not isinstance(msgs, Iterable):
+@@ -184,10 +209,12 @@ def multiple(
+     if len(msgs) == 0:
+         raise ValueError('msgs is empty')
+ 
++    normalized_msgs = [_normalize_message(message, user_properties) for message in msgs]
++
+     client = paho.Client(
+         CallbackAPIVersion.VERSION2,
+         client_id=client_id,
+-        userdata=collections.deque(msgs),
++        userdata=collections.deque(normalized_msgs),
+         protocol=protocol,
+         transport=transport,
+     )
+@@ -243,6 +270,7 @@ def single(
+     protocol: MQTTProtocolVersion = paho.MQTTv311,
+     transport: Literal["tcp", "websockets"] = "tcp",
+     proxy_args: Any | None = None,
++    user_properties: dict[str, Any] | None = None,
+ ) -> None:
+     """Publish a single message to a broker, then disconnect cleanly.
+ 
+@@ -298,9 +326,14 @@ def single(
+           raw TCP. Set to "websockets" to use WebSockets as the transport.
+ 
+     :param proxy_args: a dictionary that will be given to the client.
++
++    :param dict user_properties: (MQTT v5.0 only) user properties to merge into
++           the publish properties automatically.
+     """
+ 
+     msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
++    if user_properties is not None:
++        msg['user_properties'] = user_properties
+ 
+     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
+              protocol, transport, proxy_args)
+diff --git a/src/paho/mqtt/subscribe.py b/src/paho/mqtt/subscribe.py
+index b6c80f4..f0a900f 100644
+--- a/src/paho/mqtt/subscribe.py
++++ b/src/paho/mqtt/subscribe.py
+@@ -30,9 +30,9 @@ def _on_connect(client, userdata, flags, reason_code, properties):
+ 
+     if isinstance(userdata['topics'], list):
+         for topic in userdata['topics']:
+-            client.subscribe(topic, userdata['qos'])
++            client.subscribe(topic, userdata['qos'], user_properties=userdata['user_properties'])
+     else:
+-        client.subscribe(userdata['topics'], userdata['qos'])
++        client.subscribe(userdata['topics'], userdata['qos'], user_properties=userdata['user_properties'])
+ 
+ 
+ def _on_message_callback(client, userdata, message):
+@@ -65,7 +65,7 @@ def _on_message_simple(client, userdata, message):
+ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+              port=1883, client_id="", keepalive=60, will=None, auth=None,
+              tls=None, protocol=paho.MQTTv311, transport="tcp",
+-             clean_session=True, proxy_args=None):
++             clean_session=True, proxy_args=None, user_properties=None):
+     """Subscribe to a list of topics and process them in a callback function.
+ 
+     This function creates an MQTT client, connects to a broker and subscribes
+@@ -128,6 +128,9 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+                     Defaults to True.
+ 
+     :param proxy_args: a dictionary that will be given to the client.
++
++    :param dict user_properties: (MQTT v5.0 only) user properties to merge into
++           the subscribe properties automatically.
+     """
+ 
+     if qos < 0 or qos > 2:
+@@ -137,7 +140,8 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+         'callback':callback,
+         'topics':topics,
+         'qos':qos,
+-        'userdata':userdata}
++        'userdata':userdata,
++        'user_properties':user_properties}
+ 
+     client = paho.Client(
+         paho.CallbackAPIVersion.VERSION2,
+@@ -186,7 +190,7 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+            port=1883, client_id="", keepalive=60, will=None, auth=None,
+            tls=None, protocol=paho.MQTTv311, transport="tcp",
+-           clean_session=True, proxy_args=None):
++           clean_session=True, proxy_args=None, user_properties=None):
+     """Subscribe to a list of topics and return msg_count messages.
+ 
+     This function creates an MQTT client, connects to a broker and subscribes
+@@ -256,6 +260,9 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+                     is ignored.
+ 
+     :param proxy_args: a dictionary that will be given to the client.
++
++    :param dict user_properties: (MQTT v5.0 only) user properties to merge into
++           the subscribe properties automatically.
+     """
+ 
+     if msg_count < 1:
+@@ -276,6 +283,6 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+ 
+     callback(_on_message_simple, topics, qos, userdata, hostname, port,
+              client_id, keepalive, will, auth, tls, protocol, transport,
+-             clean_session, proxy_args)
++             clean_session, proxy_args, user_properties)
+ 
+     return userdata['messages']
+diff --git a/tests/test_client.py b/tests/test_client.py
+index 09e4606..4619460 100644
+--- a/tests/test_client.py
++++ b/tests/test_client.py
+@@ -3,6 +3,8 @@ import time
+ import unicodedata
+ 
+ import paho.mqtt.client as client
++import paho.mqtt.publish as publish
++import paho.mqtt.subscribe as subscribe
+ import pytest
+ from paho.mqtt.enums import CallbackAPIVersion, MQTTErrorCode, MQTTProtocolVersion
+ from paho.mqtt.packettypes import PacketTypes
+@@ -880,6 +882,219 @@ class TestCompatibility:
+         packet_in = fake_broker.receive_packet(1)
+         assert not packet_in  # Check connection is closed
+ 
++
++class TestPropertiesHelpers:
++    def test_with_user_properties_merges_without_mutating_original(self) -> None:
++        properties = Properties(PacketTypes.PUBLISH)
++        properties.PayloadFormatIndicator = 1
++
++        merged = Properties.with_user_properties(
++            PacketTypes.PUBLISH,
++            properties=properties,
++            user_properties={"a": "1", "b": ["2", "3"]},
++        )
++
++        assert not hasattr(properties, "UserProperty")
++        assert merged.PayloadFormatIndicator == 1
++        assert merged.UserProperty == [("a", "1"), ("b", "2"), ("b", "3")]
++
++
++class TestMQTTv5UserProperties:
++    def test_client_publish_user_properties(self, monkeypatch):
++        mqttc = client.Client(CallbackAPIVersion.VERSION2, protocol=client.MQTTv5)
++        mqttc._sock = object()
++
++        base_properties = Properties(PacketTypes.PUBLISH)
++        base_properties.PayloadFormatIndicator = 1
++        captured = {}
++
++        def fake_send_publish(mid, topic, payload, qos, retain, dup, info, properties):
++            captured['properties'] = properties
++            return MQTTErrorCode.MQTT_ERR_SUCCESS
++
++        monkeypatch.setattr(mqttc, "_send_publish", fake_send_publish)
++
++        info = mqttc.publish(
++            "topic/test",
++            "payload",
++            properties=base_properties,
++            user_properties={"trace_id": "123"},
++        )
++
++        assert info.rc == MQTTErrorCode.MQTT_ERR_SUCCESS
++        assert not hasattr(base_properties, "UserProperty")
++        assert captured['properties'] is not None
++        assert captured['properties'].PayloadFormatIndicator == 1
++        assert captured['properties'].UserProperty == [("trace_id", "123")]
++
++    def test_client_subscribe_user_properties(self, monkeypatch):
++        mqttc = client.Client(CallbackAPIVersion.VERSION2, protocol=client.MQTTv5)
++        mqttc._sock = object()
++
++        base_properties = Properties(PacketTypes.SUBSCRIBE)
++        base_properties.SubscriptionIdentifier = 7
++        captured = {}
++
++        def fake_send_subscribe(dup, topics, properties):
++            captured['properties'] = properties
++            return (MQTTErrorCode.MQTT_ERR_SUCCESS, 42)
++
++        monkeypatch.setattr(mqttc, "_send_subscribe", fake_send_subscribe)
++
++        result, mid = mqttc.subscribe(
++            "topic/test",
++            qos=1,
++            properties=base_properties,
++            user_properties={"trace_id": "123"},
++        )
++
++        assert result == MQTTErrorCode.MQTT_ERR_SUCCESS
++        assert mid == 42
++        assert not hasattr(base_properties, "UserProperty")
++        assert captured['properties'] is not None
++        assert captured['properties'].SubscriptionIdentifier == [7]
++        assert captured['properties'].UserProperty == [("trace_id", "123")]
++
++    def test_publish_single_user_properties(self, monkeypatch):
++        captured = {}
++
++        def fake_multiple(msgs, hostname, port, client_id, keepalive, will, auth, tls, protocol, transport, proxy_args):
++            captured['msgs'] = msgs
++
++        monkeypatch.setattr(publish, "multiple", fake_multiple)
++
++        publish.single("topic/test", "payload", protocol=client.MQTTv5, user_properties={"trace_id": "123"})
++
++        assert captured['msgs'][0]['user_properties'] == {"trace_id": "123"}
++
++    def test_publish_multiple_user_properties(self, monkeypatch):
++        created_clients = []
++
++        class FakePublishClient:
++            def __init__(self, *args, **kwargs):
++                self._userdata = kwargs['userdata']
++                self.on_publish = None
++                self.on_connect = None
++                self.published = []
++                created_clients.append(self)
++
++            def enable_logger(self):
++                return None
++
++            def proxy_set(self, **kwargs):
++                return None
++
++            def username_pw_set(self, username, password=None):
++                return None
++
++            def will_set(self, **kwargs):
++                return None
++
++            def tls_set(self, **kwargs):
++                return None
++
++            def tls_insecure_set(self, insecure):
++                return None
++
++            def tls_set_context(self, context):
++                return None
++
++            def connect(self, hostname, port, keepalive):
++                return None
++
++            def publish(self, *args, **kwargs):
++                self.published.append((args, kwargs))
++                return None
++
++            def disconnect(self):
++                return None
++
++            def loop_forever(self):
++                self.on_connect(self, self._userdata, None, 0, None)
++                while self._userdata:
++                    self.on_publish(self, self._userdata, len(self.published), ReasonCode(PacketTypes.PUBACK), Properties(PacketTypes.PUBACK))
++
++        monkeypatch.setattr(publish.paho, "Client", FakePublishClient)
++
++        publish.multiple(
++            [
++                ("topic/tuple", "payload", 0, False),
++                {"topic": "topic/dict", "payload": "payload", "qos": 1, "retain": False},
++            ],
++            protocol=client.MQTTv5,
++            user_properties={"trace_id": "123"},
++        )
++
++        assert len(created_clients) == 1
++        assert created_clients[0].published[0][1]['user_properties'] == {"trace_id": "123"}
++        assert created_clients[0].published[1][1]['user_properties'] == {"trace_id": "123"}
++
++    def test_subscribe_callback_user_properties(self, monkeypatch):
++        created_clients = []
++
++        class FakeSubscribeClient:
++            def __init__(self, *args, **kwargs):
++                self._userdata = kwargs['userdata']
++                self.on_message = None
++                self.on_connect = None
++                self.subscriptions = []
++                created_clients.append(self)
++
++            def enable_logger(self):
++                return None
++
++            def proxy_set(self, **kwargs):
++                return None
++
++            def username_pw_set(self, username, password=None):
++                return None
++
++            def will_set(self, **kwargs):
++                return None
++
++            def tls_set(self, **kwargs):
++                return None
++
++            def tls_insecure_set(self, insecure):
++                return None
++
++            def tls_set_context(self, context):
++                return None
++
++            def connect(self, hostname, port, keepalive):
++                return None
++
++            def subscribe(self, *args, **kwargs):
++                self.subscriptions.append((args, kwargs))
++                return (MQTTErrorCode.MQTT_ERR_SUCCESS, 1)
++
++            def loop_forever(self):
++                self.on_connect(self, self._userdata, None, 0, None)
++
++        monkeypatch.setattr(subscribe.paho, "Client", FakeSubscribeClient)
++
++        subscribe.callback(
++            lambda *args: None,
++            "topic/test",
++            protocol=client.MQTTv5,
++            user_properties={"trace_id": "123"},
++        )
++
++        assert len(created_clients) == 1
++        assert created_clients[0].subscriptions[0][1]['user_properties'] == {"trace_id": "123"}
++
++    def test_subscribe_simple_user_properties(self, monkeypatch):
++        captured = {}
++
++        def fake_callback(*args):
++            captured['user_properties'] = args[-1]
++
++        monkeypatch.setattr(subscribe, "callback", fake_callback)
++
++        subscribe.simple("topic/test", protocol=client.MQTTv5, user_properties={"trace_id": "123"})
++
++        assert captured['user_properties'] == {"trace_id": "123"}
++
+     def test_callback_v2_mqtt3(self, fake_broker):
+         callback_called = []
+         mqttc = client.Client(

@@ -3,6 +3,8 @@ import time
 import unicodedata
 
 import paho.mqtt.client as client
+import paho.mqtt.publish as publish
+import paho.mqtt.subscribe as subscribe
 import pytest
 from paho.mqtt.enums import CallbackAPIVersion, MQTTErrorCode, MQTTProtocolVersion
 from paho.mqtt.packettypes import PacketTypes
@@ -879,6 +881,219 @@ class TestCompatibility:
 
         packet_in = fake_broker.receive_packet(1)
         assert not packet_in  # Check connection is closed
+
+
+class TestPropertiesHelpers:
+    def test_with_user_properties_merges_without_mutating_original(self) -> None:
+        properties = Properties(PacketTypes.PUBLISH)
+        properties.PayloadFormatIndicator = 1
+
+        merged = Properties.with_user_properties(
+            PacketTypes.PUBLISH,
+            properties=properties,
+            user_properties={"a": "1", "b": ["2", "3"]},
+        )
+
+        assert not hasattr(properties, "UserProperty")
+        assert merged.PayloadFormatIndicator == 1
+        assert merged.UserProperty == [("a", "1"), ("b", "2"), ("b", "3")]
+
+
+class TestMQTTv5UserProperties:
+    def test_client_publish_user_properties(self, monkeypatch):
+        mqttc = client.Client(CallbackAPIVersion.VERSION2, protocol=client.MQTTv5)
+        mqttc._sock = object()
+
+        base_properties = Properties(PacketTypes.PUBLISH)
+        base_properties.PayloadFormatIndicator = 1
+        captured = {}
+
+        def fake_send_publish(mid, topic, payload, qos, retain, dup, info, properties):
+            captured['properties'] = properties
+            return MQTTErrorCode.MQTT_ERR_SUCCESS
+
+        monkeypatch.setattr(mqttc, "_send_publish", fake_send_publish)
+
+        info = mqttc.publish(
+            "topic/test",
+            "payload",
+            properties=base_properties,
+            user_properties={"trace_id": "123"},
+        )
+
+        assert info.rc == MQTTErrorCode.MQTT_ERR_SUCCESS
+        assert not hasattr(base_properties, "UserProperty")
+        assert captured['properties'] is not None
+        assert captured['properties'].PayloadFormatIndicator == 1
+        assert captured['properties'].UserProperty == [("trace_id", "123")]
+
+    def test_client_subscribe_user_properties(self, monkeypatch):
+        mqttc = client.Client(CallbackAPIVersion.VERSION2, protocol=client.MQTTv5)
+        mqttc._sock = object()
+
+        base_properties = Properties(PacketTypes.SUBSCRIBE)
+        base_properties.SubscriptionIdentifier = 7
+        captured = {}
+
+        def fake_send_subscribe(dup, topics, properties):
+            captured['properties'] = properties
+            return (MQTTErrorCode.MQTT_ERR_SUCCESS, 42)
+
+        monkeypatch.setattr(mqttc, "_send_subscribe", fake_send_subscribe)
+
+        result, mid = mqttc.subscribe(
+            "topic/test",
+            qos=1,
+            properties=base_properties,
+            user_properties={"trace_id": "123"},
+        )
+
+        assert result == MQTTErrorCode.MQTT_ERR_SUCCESS
+        assert mid == 42
+        assert not hasattr(base_properties, "UserProperty")
+        assert captured['properties'] is not None
+        assert captured['properties'].SubscriptionIdentifier == [7]
+        assert captured['properties'].UserProperty == [("trace_id", "123")]
+
+    def test_publish_single_user_properties(self, monkeypatch):
+        captured = {}
+
+        def fake_multiple(msgs, hostname, port, client_id, keepalive, will, auth, tls, protocol, transport, proxy_args):
+            captured['msgs'] = msgs
+
+        monkeypatch.setattr(publish, "multiple", fake_multiple)
+
+        publish.single("topic/test", "payload", protocol=client.MQTTv5, user_properties={"trace_id": "123"})
+
+        assert captured['msgs'][0]['user_properties'] == {"trace_id": "123"}
+
+    def test_publish_multiple_user_properties(self, monkeypatch):
+        created_clients = []
+
+        class FakePublishClient:
+            def __init__(self, *args, **kwargs):
+                self._userdata = kwargs['userdata']
+                self.on_publish = None
+                self.on_connect = None
+                self.published = []
+                created_clients.append(self)
+
+            def enable_logger(self):
+                return None
+
+            def proxy_set(self, **kwargs):
+                return None
+
+            def username_pw_set(self, username, password=None):
+                return None
+
+            def will_set(self, **kwargs):
+                return None
+
+            def tls_set(self, **kwargs):
+                return None
+
+            def tls_insecure_set(self, insecure):
+                return None
+
+            def tls_set_context(self, context):
+                return None
+
+            def connect(self, hostname, port, keepalive):
+                return None
+
+            def publish(self, *args, **kwargs):
+                self.published.append((args, kwargs))
+                return None
+
+            def disconnect(self):
+                return None
+
+            def loop_forever(self):
+                self.on_connect(self, self._userdata, None, 0, None)
+                while self._userdata:
+                    self.on_publish(self, self._userdata, len(self.published), ReasonCode(PacketTypes.PUBACK), Properties(PacketTypes.PUBACK))
+
+        monkeypatch.setattr(publish.paho, "Client", FakePublishClient)
+
+        publish.multiple(
+            [
+                ("topic/tuple", "payload", 0, False),
+                {"topic": "topic/dict", "payload": "payload", "qos": 1, "retain": False},
+            ],
+            protocol=client.MQTTv5,
+            user_properties={"trace_id": "123"},
+        )
+
+        assert len(created_clients) == 1
+        assert created_clients[0].published[0][1]['user_properties'] == {"trace_id": "123"}
+        assert created_clients[0].published[1][1]['user_properties'] == {"trace_id": "123"}
+
+    def test_subscribe_callback_user_properties(self, monkeypatch):
+        created_clients = []
+
+        class FakeSubscribeClient:
+            def __init__(self, *args, **kwargs):
+                self._userdata = kwargs['userdata']
+                self.on_message = None
+                self.on_connect = None
+                self.subscriptions = []
+                created_clients.append(self)
+
+            def enable_logger(self):
+                return None
+
+            def proxy_set(self, **kwargs):
+                return None
+
+            def username_pw_set(self, username, password=None):
+                return None
+
+            def will_set(self, **kwargs):
+                return None
+
+            def tls_set(self, **kwargs):
+                return None
+
+            def tls_insecure_set(self, insecure):
+                return None
+
+            def tls_set_context(self, context):
+                return None
+
+            def connect(self, hostname, port, keepalive):
+                return None
+
+            def subscribe(self, *args, **kwargs):
+                self.subscriptions.append((args, kwargs))
+                return (MQTTErrorCode.MQTT_ERR_SUCCESS, 1)
+
+            def loop_forever(self):
+                self.on_connect(self, self._userdata, None, 0, None)
+
+        monkeypatch.setattr(subscribe.paho, "Client", FakeSubscribeClient)
+
+        subscribe.callback(
+            lambda *args: None,
+            "topic/test",
+            protocol=client.MQTTv5,
+            user_properties={"trace_id": "123"},
+        )
+
+        assert len(created_clients) == 1
+        assert created_clients[0].subscriptions[0][1]['user_properties'] == {"trace_id": "123"}
+
+    def test_subscribe_simple_user_properties(self, monkeypatch):
+        captured = {}
+
+        def fake_callback(*args):
+            captured['user_properties'] = args[-1]
+
+        monkeypatch.setattr(subscribe, "callback", fake_callback)
+
+        subscribe.simple("topic/test", protocol=client.MQTTv5, user_properties={"trace_id": "123"})
+
+        assert captured['user_properties'] == {"trace_id": "123"}
 
     def test_callback_v2_mqtt3(self, fake_broker):
         callback_called = []

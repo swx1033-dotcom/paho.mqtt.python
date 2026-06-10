@@ -1713,6 +1713,7 @@ class Client:
         qos: int = 0,
         retain: bool = False,
         properties: Properties | None = None,
+        user_properties: dict[str, Any] | None = None,
     ) -> MQTTMessageInfo:
         """Publish a message on a topic.
 
@@ -1729,6 +1730,8 @@ class Client:
         :param bool retain: If set to true, the message will be set as the "last known
             good"/retained message for the topic.
         :param Properties properties: (MQTT v5.0 only) the MQTT v5.0 properties to be included.
+        :param dict user_properties: (MQTT v5.0 only) user properties to merge into the
+            publish properties automatically.
 
         Returns a `MQTTMessageInfo` class, which can be used to determine whether
         the message has been delivered (using `is_published()`) or to block
@@ -1768,6 +1771,7 @@ class Client:
             raise ValueError('Payload too large.')
 
         local_mid = self._mid_generate()
+        properties = Properties.with_user_properties(PacketTypes.PUBLISH, properties, user_properties)
 
         if qos == 0:
             info = MQTTMessageInfo(local_mid)
@@ -1897,6 +1901,7 @@ class Client:
         qos: int = 0,
         options: SubscribeOptions | None = None,
         properties: Properties | None = None,
+        user_properties: dict[str, Any] | None = None,
     ) -> tuple[MQTTErrorCode, int | None]:
         """Subscribe the client to one or more topics.
 
@@ -1967,6 +1972,9 @@ class Client:
         :properties: a Properties instance setting the MQTT v5.0 properties
             to be included. Optional - if not set, no properties are sent.
 
+        :param dict user_properties: (MQTT v5.0 only) user properties to merge into the
+            subscribe properties automatically.
+
         The function returns a tuple (result, mid), where result is
         MQTT_ERR_SUCCESS to indicate success or (MQTT_ERR_NO_CONN, None) if the
         client is not currently connected.  mid is the message ID for the
@@ -2034,6 +2042,8 @@ class Client:
 
         if self._sock is None:
             return (MQTT_ERR_NO_CONN, None)
+
+        properties = Properties.with_user_properties(PacketTypes.SUBSCRIBE, properties, user_properties)
 
         return self._send_subscribe(False, topic_qos_list, properties)
 

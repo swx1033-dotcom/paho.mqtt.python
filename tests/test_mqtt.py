@@ -1,0 +1,58 @@
+import time
+import pytest
+from paho.mqtt.client import topic_matches_sub
+from paho.mqtt.matcher import MQTTMatcher
+
+def test_trie_vs_linear_benchmark():
+    """
+    A manual benchmark test that prints out the performance difference
+    between Trie-based matching (MQTTMatcher) and linear matching.
+    """
+    num_subs = 10000
+    matcher = MQTTMatcher()
+    linear_subs = []
+    
+    for i in range(num_subs):
+        sub = f"device/groupA/node{i}/status"
+        matcher[sub] = i
+        linear_subs.append((sub, i))
+        
+    matcher["device/groupA/+/status"] = "plus"
+    linear_subs.append(("device/groupA/+/status", "plus"))
+    
+    matcher["device/#"] = "hash"
+    linear_subs.append(("device/#", "hash"))
+    
+    target_topic = "device/groupA/node9999/status"
+    
+    # Verify correctness first
+    def linear_scan():
+        matches = []
+        for sub, val in linear_subs:
+            if topic_matches_sub(sub, target_topic):
+                matches.append(val)
+        return matches
+
+    def trie_scan():
+        return list(matcher.iter_match(target_topic))
+        
+    assert set(linear_scan()) == set(trie_scan()), "Mismatch between linear and Trie results"
+    
+    # Benchmark Linear scan
+    start_time = time.time()
+    for _ in range(10):
+        linear_scan()
+    linear_time = time.time() - start_time
+    
+    # Benchmark Trie scan
+    start_time = time.time()
+    for _ in range(10):
+        trie_scan()
+    trie_time = time.time() - start_time
+    
+    print(f"\n[Benchmark] {num_subs} subscriptions, 10 iterations:")
+    print(f"Linear Scan Time: {linear_time:.4f}s")
+    print(f"Trie Scan Time:   {trie_time:.4f}s")
+    print(f"Speedup:          {linear_time / trie_time:.2f}x")
+    
+    assert trie_time < linear_time, "Trie should be faster than linear scan!"

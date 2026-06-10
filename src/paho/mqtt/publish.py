@@ -30,6 +30,8 @@ from paho.mqtt.reasoncodes import ReasonCode
 
 from .. import mqtt
 from . import client as paho
+from .client import _apply_user_properties
+from paho.mqtt.packettypes import PacketTypes
 
 if TYPE_CHECKING:
     try:
@@ -63,6 +65,8 @@ if TYPE_CHECKING:
         payload: NotRequired[paho.PayloadType]
         qos: NotRequired[int]
         retain: NotRequired[bool]
+        properties: NotRequired[Properties]
+        user_properties: NotRequired[dict[str, str]]
 
     MessageTuple = Tuple[str, paho.PayloadType, int, bool]
 
@@ -135,6 +139,8 @@ def multiple(
            will be published.
            If qos is not present, the default of 0 is used.
            If retain is not present, the default of False is used.
+           Additional MQTT v5.0 keys ``properties`` (a Properties instance)
+           and/or ``user_properties`` (a ``{str: str}`` dict) may be supplied.
 
            If a tuple, then it must be of the form:
            ("<topic>", "<payload>", qos, retain)
@@ -243,6 +249,8 @@ def single(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    properties: Properties | None = None,
+    user_properties: dict[str, str] | None = None,
 ) -> None:
     """Publish a single message to a broker, then disconnect cleanly.
 
@@ -298,9 +306,20 @@ def single(
           raw TCP. Set to "websockets" to use WebSockets as the transport.
 
     :param proxy_args: a dictionary that will be given to the client.
+
+    :param Properties properties: (MQTT v5.0 only) a Properties instance setting
+        the MQTT v5.0 properties to be included. Optional - if not set, no
+        properties are sent.
+
+    :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
+        properties to attach to the publish packet. These are appended as
+        ``UserProperty`` entries on top of any existing ``properties``.
     """
 
-    msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
+    properties = _apply_user_properties(properties, user_properties, PacketTypes.PUBLISH)
+
+    msg: MessageDict = {'topic': topic, 'payload': payload, 'qos': qos, 'retain': retain,
+                        'properties': properties}
 
     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
              protocol, transport, proxy_args)

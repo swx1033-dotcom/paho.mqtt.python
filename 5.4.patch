@@ -1,0 +1,443 @@
+diff --git a/src/paho/mqtt/client.py b/src/paho/mqtt/client.py
+index 4ccc869..dc529f4 100644
+--- a/src/paho/mqtt/client.py
++++ b/src/paho/mqtt/client.py
+@@ -483,6 +483,47 @@ def _encode_payload(payload: str | bytes | bytearray | int | float | None) -> by
+     return payload
+ 
+ 
++def _apply_user_properties(
++    properties: Properties | None,
++    user_properties: dict[str, str] | None,
++    packet_type: int,
++) -> Properties | None:
++    """Return a ``Properties`` instance which combines ``properties`` (optional)
++    with the ``user_properties`` dict (optional).
++
++    * When neither ``properties`` nor ``user_properties`` are provided, ``None``
++      is returned so that no properties are sent.
++    * When only ``properties`` is provided, it is returned unchanged.
++    * When only ``user_properties`` is provided, a new ``Properties`` is created
++      and filled with ``UserProperty`` entries from the dict.
++    * When both are provided, a *copy* of ``properties`` is made and the user
++      properties from ``user_properties`` are appended to it. The original
++      ``properties`` object is never mutated.
++    """
++    if not user_properties:
++        return properties
++
++    if not isinstance(user_properties, dict):
++        raise ValueError("user_properties must be a dict {str: str}.")
++
++    if properties is None:
++        merged = Properties(packet_type)
++    else:
++        # Clone the existing Properties instance so we don't mutate the caller's
++        # object. Properties does not expose a copy protocol, so we replicate
++        # the properties by packing/unpacking the serialized form.
++        merged = Properties(packet_type)
++        packed = properties.pack()
++        # packed starts with the variable-byte length prefix; skip it by using
++        # the packer's own output which is valid to unpack.
++        merged.unpack(packed)
++
++    for k, v in user_properties.items():
++        merged.UserProperty = (k, v)
++
++    return merged
++
++
+ class MQTTMessageInfo:
+     """This is a class returned from `Client.publish()` and can be used to find
+     out the mid of the message that was published, and to determine whether the
+@@ -1713,6 +1754,7 @@ class Client:
+         qos: int = 0,
+         retain: bool = False,
+         properties: Properties | None = None,
++        user_properties: dict[str, str] | None = None,
+     ) -> MQTTMessageInfo:
+         """Publish a message on a topic.
+ 
+@@ -1729,6 +1771,11 @@ class Client:
+         :param bool retain: If set to true, the message will be set as the "last known
+             good"/retained message for the topic.
+         :param Properties properties: (MQTT v5.0 only) the MQTT v5.0 properties to be included.
++        :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
++            properties to attach to the publish packet. These are appended as
++            ``UserProperty`` entries on top of any existing ``properties``. This is a
++            convenience that avoids having to construct a ``Properties`` object
++            manually.
+ 
+         Returns a `MQTTMessageInfo` class, which can be used to determine whether
+         the message has been delivered (using `is_published()`) or to block
+@@ -1767,6 +1814,8 @@ class Client:
+         if len(local_payload) > 268435455:
+             raise ValueError('Payload too large.')
+ 
++        properties = _apply_user_properties(properties, user_properties, PacketTypes.PUBLISH)
++
+         local_mid = self._mid_generate()
+ 
+         if qos == 0:
+@@ -1897,6 +1946,7 @@ class Client:
+         qos: int = 0,
+         options: SubscribeOptions | None = None,
+         properties: Properties | None = None,
++        user_properties: dict[str, str] | None = None,
+     ) -> tuple[MQTTErrorCode, int | None]:
+         """Subscribe the client to one or more topics.
+ 
+@@ -1910,6 +1960,7 @@ class Client:
+         :qos: The desired quality of service level for the subscription.
+             Defaults to 0.
+         :options and properties: Not used.
++        :user_properties: Not used.
+ 
+         Simple string and subscribe options (MQTT v5.0 only)
+         ----------------------------------------------------
+@@ -1920,6 +1971,9 @@ class Client:
+         :options: The MQTT v5.0 subscribe options.
+         :properties: a Properties instance setting the MQTT v5.0 properties
+             to be included. Optional - if not set, no properties are sent.
++        :user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
++            properties to attach to the subscribe packet. These are appended as
++            ``UserProperty`` entries on top of any existing ``properties``.
+ 
+         String and integer tuple
+         ------------------------
+@@ -1930,6 +1984,8 @@ class Client:
+         :qos and options: Not used.
+         :properties: Only used for MQTT v5.0.  A Properties instance setting the
+             MQTT v5.0 properties. Optional - if not set, no properties are sent.
++        :user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
++            properties to attach to the subscribe packet.
+ 
+         String and subscribe options tuple (MQTT v5.0 only)
+         ---------------------------------------------------
+@@ -1940,6 +1996,8 @@ class Client:
+         :qos and options: Not used.
+         :properties: a Properties instance setting the MQTT v5.0 properties
+             to be included. Optional - if not set, no properties are sent.
++        :user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
++            properties.
+ 
+         List of string and integer tuples
+         ---------------------------------
+@@ -1952,6 +2010,7 @@ class Client:
+         :topic: A list of tuple of format (topic, qos). Both topic and qos must
+                be present in all of the tuples.
+         :qos, options and properties: Not used.
++        :user_properties: Not used.
+ 
+         List of string and subscribe option tuples (MQTT v5.0 only)
+         -----------------------------------------------------------
+@@ -1966,6 +2025,8 @@ class Client:
+         :qos and options: Not used.
+         :properties: a Properties instance setting the MQTT v5.0 properties
+             to be included. Optional - if not set, no properties are sent.
++        :user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
++            properties.
+ 
+         The function returns a tuple (result, mid), where result is
+         MQTT_ERR_SUCCESS to indicate success or (MQTT_ERR_NO_CONN, None) if the
+@@ -1977,6 +2038,8 @@ class Client:
+         Raises a ValueError if qos is not 0, 1 or 2, or if topic is None or has
+         zero string length, or if topic is not a string, tuple or list.
+         """
++        properties = _apply_user_properties(properties, user_properties, PacketTypes.SUBSCRIBE)
++
+         topic_qos_list = None
+ 
+         if isinstance(topic, tuple):
+@@ -2038,7 +2101,10 @@ class Client:
+         return self._send_subscribe(False, topic_qos_list, properties)
+ 
+     def unsubscribe(
+-        self, topic: str | list[str], properties: Properties | None = None
++        self,
++        topic: str | list[str],
++        properties: Properties | None = None,
++        user_properties: dict[str, str] | None = None,
+     ) -> tuple[MQTTErrorCode, int | None]:
+         """Unsubscribe the client from one or more topics.
+ 
+@@ -2046,6 +2112,8 @@ class Client:
+             topics to unsubscribe from.
+         :param properties: (MQTT v5.0 only) a Properties instance setting the MQTT v5.0 properties
+             to be included. Optional - if not set, no properties are sent.
++        :param user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
++            properties to attach to the unsubscribe packet.
+ 
+         Returns a tuple (result, mid), where result is MQTT_ERR_SUCCESS
+         to indicate success or (MQTT_ERR_NO_CONN, None) if the client is not
+@@ -2057,6 +2125,8 @@ class Client:
+         :raises ValueError: if topic is None or has zero string length, or is
+             not a string or list.
+         """
++        properties = _apply_user_properties(properties, user_properties, PacketTypes.UNSUBSCRIBE)
++
+         topic_list = None
+         if topic is None:
+             raise ValueError('Invalid topic.')
+@@ -2197,6 +2267,7 @@ class Client:
+         qos: int = 0,
+         retain: bool = False,
+         properties: Properties | None = None,
++        user_properties: dict[str, str] | None = None,
+     ) -> None:
+         """Set a Will to be sent by the broker in case the client disconnects unexpectedly.
+ 
+@@ -2213,6 +2284,9 @@ class Client:
+             good"/retained message for the topic.
+         :param Properties properties: (MQTT v5.0 only) the MQTT v5.0 properties
+             to be included with the will message. Optional - if not set, no properties are sent.
++        :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
++            properties to attach to the will message. These are appended as
++            ``UserProperty`` entries on top of any existing ``properties``.
+ 
+         :raises ValueError: if qos is not 0, 1 or 2, or if topic is None or has
+             zero string length.
+@@ -2230,6 +2304,8 @@ class Client:
+             raise ValueError(
+                 "The properties argument must be an instance of the Properties class.")
+ 
++        properties = _apply_user_properties(properties, user_properties, PacketTypes.WILLMESSAGE)
++
+         self._will_payload = _encode_payload(payload)
+         self._will = True
+         self._will_topic = topic.encode('utf-8')
+diff --git a/src/paho/mqtt/properties.py b/src/paho/mqtt/properties.py
+index f307b86..a081836 100644
+--- a/src/paho/mqtt/properties.py
++++ b/src/paho/mqtt/properties.py
+@@ -239,6 +239,41 @@ class Properties:
+     def allowsMultiple(self, compressedName):
+         return self.getIdentFromName(compressedName) in [11, 38]
+ 
++    def add_user_properties(self, user_properties: dict[str, str] | None) -> None:
++        """Add user properties (UTF-8 string pairs) to this Properties instance.
++
++        This is a convenience method that accepts a ``dict`` mapping ``{str: str}``
++        and appends each entry as a ``UserProperty`` (property identifier 38).
++        ``None`` or an empty dict is a no-op.
++
++        Example::
++
++            props = Properties(PacketTypes.PUBLISH)
++            props.add_user_properties({"foo": "bar", "baz": "qux"})
++        """
++        if not user_properties:
++            return
++        if not isinstance(user_properties, dict):
++            raise MQTTException("user_properties must be a dict {str: str}.")
++        for k, v in user_properties.items():
++            setattr(self, "UserProperty", (k, v))
++
++    @staticmethod
++    def from_user_properties(packetType, user_properties: dict[str, str] | None) -> "Properties | None":
++        """Create a new :class:`Properties` instance that only contains the given
++        user properties as ``UserProperty`` entries.
++
++        Returns ``None`` when ``user_properties`` is ``None`` or empty, so that
++        callers can easily pass the result as the ``properties`` argument of
++        :meth:`Client.publish` / :meth:`Client.subscribe` / ... without
++        introducing properties when none were requested.
++        """
++        if not user_properties:
++            return None
++        props = Properties(packetType)
++        props.add_user_properties(user_properties)
++        return props
++
+     def getIdentFromName(self, compressedName):
+         # return the identifier corresponding to the property name
+         result = -1
+diff --git a/src/paho/mqtt/publish.py b/src/paho/mqtt/publish.py
+index 333c190..14743d1 100644
+--- a/src/paho/mqtt/publish.py
++++ b/src/paho/mqtt/publish.py
+@@ -30,6 +30,8 @@ from paho.mqtt.reasoncodes import ReasonCode
+ 
+ from .. import mqtt
+ from . import client as paho
++from .client import _apply_user_properties
++from paho.mqtt.packettypes import PacketTypes
+ 
+ if TYPE_CHECKING:
+     try:
+@@ -63,6 +65,8 @@ if TYPE_CHECKING:
+         payload: NotRequired[paho.PayloadType]
+         qos: NotRequired[int]
+         retain: NotRequired[bool]
++        properties: NotRequired[Properties]
++        user_properties: NotRequired[dict[str, str]]
+ 
+     MessageTuple = Tuple[str, paho.PayloadType, int, bool]
+ 
+@@ -135,6 +139,8 @@ def multiple(
+            will be published.
+            If qos is not present, the default of 0 is used.
+            If retain is not present, the default of False is used.
++           Additional MQTT v5.0 keys ``properties`` (a Properties instance)
++           and/or ``user_properties`` (a ``{str: str}`` dict) may be supplied.
+ 
+            If a tuple, then it must be of the form:
+            ("<topic>", "<payload>", qos, retain)
+@@ -243,6 +249,8 @@ def single(
+     protocol: MQTTProtocolVersion = paho.MQTTv311,
+     transport: Literal["tcp", "websockets"] = "tcp",
+     proxy_args: Any | None = None,
++    properties: Properties | None = None,
++    user_properties: dict[str, str] | None = None,
+ ) -> None:
+     """Publish a single message to a broker, then disconnect cleanly.
+ 
+@@ -298,9 +306,20 @@ def single(
+           raw TCP. Set to "websockets" to use WebSockets as the transport.
+ 
+     :param proxy_args: a dictionary that will be given to the client.
++
++    :param Properties properties: (MQTT v5.0 only) a Properties instance setting
++        the MQTT v5.0 properties to be included. Optional - if not set, no
++        properties are sent.
++
++    :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
++        properties to attach to the publish packet. These are appended as
++        ``UserProperty`` entries on top of any existing ``properties``.
+     """
+ 
+-    msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
++    properties = _apply_user_properties(properties, user_properties, PacketTypes.PUBLISH)
++
++    msg: MessageDict = {'topic': topic, 'payload': payload, 'qos': qos, 'retain': retain,
++                        'properties': properties}
+ 
+     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
+              protocol, transport, proxy_args)
+diff --git a/src/paho/mqtt/subscribe.py b/src/paho/mqtt/subscribe.py
+index b6c80f4..b83059b 100644
+--- a/src/paho/mqtt/subscribe.py
++++ b/src/paho/mqtt/subscribe.py
+@@ -21,6 +21,8 @@ you to pass a callback for processing of messages.
+ 
+ from .. import mqtt
+ from . import client as paho
++from .client import _apply_user_properties
++from paho.mqtt.packettypes import PacketTypes
+ 
+ 
+ def _on_connect(client, userdata, flags, reason_code, properties):
+@@ -30,9 +32,11 @@ def _on_connect(client, userdata, flags, reason_code, properties):
+ 
+     if isinstance(userdata['topics'], list):
+         for topic in userdata['topics']:
+-            client.subscribe(topic, userdata['qos'])
++            client.subscribe(topic, userdata['qos'], properties=userdata.get('properties'),
++                             user_properties=userdata.get('user_properties'))
+     else:
+-        client.subscribe(userdata['topics'], userdata['qos'])
++        client.subscribe(userdata['topics'], userdata['qos'], properties=userdata.get('properties'),
++                         user_properties=userdata.get('user_properties'))
+ 
+ 
+ def _on_message_callback(client, userdata, message):
+@@ -65,7 +69,8 @@ def _on_message_simple(client, userdata, message):
+ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+              port=1883, client_id="", keepalive=60, will=None, auth=None,
+              tls=None, protocol=paho.MQTTv311, transport="tcp",
+-             clean_session=True, proxy_args=None):
++             clean_session=True, proxy_args=None, properties=None,
++             user_properties=None):
+     """Subscribe to a list of topics and process them in a callback function.
+ 
+     This function creates an MQTT client, connects to a broker and subscribes
+@@ -97,7 +102,6 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+            "<topic>", 'payload':"<payload">, 'qos':<qos>, 'retain':<retain>}.
+            Topic is required, all other parameters are optional and will
+            default to None, 0 and False respectively.
+-
+            Defaults to None, which indicates no will should be used.
+ 
+     :param auth: a dict containing authentication parameters for the client:
+@@ -128,16 +132,28 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+                     Defaults to True.
+ 
+     :param proxy_args: a dictionary that will be given to the client.
++
++    :param properties: (MQTT v5.0 only) a Properties instance setting the MQTT
++        v5.0 properties to be included with the subscribe packet. Optional -
++        if not set, no properties are sent.
++
++    :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of
++        user properties to attach to the subscribe packet. These are appended
++        as ``UserProperty`` entries on top of any existing ``properties``.
+     """
+ 
+     if qos < 0 or qos > 2:
+         raise ValueError('qos must be in the range 0-2')
+ 
++    properties = _apply_user_properties(properties, user_properties, PacketTypes.SUBSCRIBE)
++
+     callback_userdata = {
+-        'callback':callback,
+-        'topics':topics,
+-        'qos':qos,
+-        'userdata':userdata}
++        'callback': callback,
++        'topics': topics,
++        'qos': qos,
++        'userdata': userdata,
++        'properties': properties,
++    }
+ 
+     client = paho.Client(
+         paho.CallbackAPIVersion.VERSION2,
+@@ -185,8 +201,9 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+ 
+ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+            port=1883, client_id="", keepalive=60, will=None, auth=None,
+-           tls=None, protocol=paho.MQTTv311, transport="tcp",
+-           clean_session=True, proxy_args=None):
++           tls=None, protocol=paho.MQTTv50, transport="tcp",
++           clean_session=True, proxy_args=None, properties=None,
++           user_properties=None):
+     """Subscribe to a list of topics and return msg_count messages.
+ 
+     This function creates an MQTT client, connects to a broker and subscribes
+@@ -242,7 +259,7 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+           processed using the tls_set_context method.
+           Defaults to None, which indicates that TLS should not be used.
+ 
+-    :param protocol: the MQTT protocol version to use. Defaults to MQTTv311.
++    :param protocol: the MQTT protocol version to use. Defaults to MQTTv50.
+ 
+     :param transport: set to "tcp" to use the default setting of transport which is
+           raw TCP. Set to "websockets" to use WebSockets as the transport.
+@@ -256,6 +273,14 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+                     is ignored.
+ 
+     :param proxy_args: a dictionary that will be given to the client.
++
++    :param properties: (MQTT v5.0 only) a Properties instance setting the MQTT
++        v5.0 properties to be included with the subscribe packet. Optional -
++        if not set, no properties are sent.
++
++    :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of
++        user properties to attach to the subscribe packet. These are appended
++        as ``UserProperty`` entries on top of any existing ``properties``.
+     """
+ 
+     if msg_count < 1:
+@@ -272,10 +297,10 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+     if protocol == paho.MQTTv5:
+         clean_session = None
+ 
+-    userdata = {'retained':retained, 'msg_count':msg_count, 'messages':messages}
++    userdata = {'retained': retained, 'msg_count': msg_count, 'messages': messages}
+ 
+     callback(_on_message_simple, topics, qos, userdata, hostname, port,
+              client_id, keepalive, will, auth, tls, protocol, transport,
+-             clean_session, proxy_args)
++             clean_session, proxy_args, properties, user_properties)
+ 
+     return userdata['messages']

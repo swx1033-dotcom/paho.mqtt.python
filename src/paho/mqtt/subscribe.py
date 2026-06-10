@@ -21,6 +21,8 @@ you to pass a callback for processing of messages.
 
 from .. import mqtt
 from . import client as paho
+from .client import _apply_user_properties
+from paho.mqtt.packettypes import PacketTypes
 
 
 def _on_connect(client, userdata, flags, reason_code, properties):
@@ -30,9 +32,11 @@ def _on_connect(client, userdata, flags, reason_code, properties):
 
     if isinstance(userdata['topics'], list):
         for topic in userdata['topics']:
-            client.subscribe(topic, userdata['qos'])
+            client.subscribe(topic, userdata['qos'], properties=userdata.get('properties'),
+                             user_properties=userdata.get('user_properties'))
     else:
-        client.subscribe(userdata['topics'], userdata['qos'])
+        client.subscribe(userdata['topics'], userdata['qos'], properties=userdata.get('properties'),
+                         user_properties=userdata.get('user_properties'))
 
 
 def _on_message_callback(client, userdata, message):
@@ -65,7 +69,8 @@ def _on_message_simple(client, userdata, message):
 def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
              port=1883, client_id="", keepalive=60, will=None, auth=None,
              tls=None, protocol=paho.MQTTv311, transport="tcp",
-             clean_session=True, proxy_args=None):
+             clean_session=True, proxy_args=None, properties=None,
+             user_properties=None):
     """Subscribe to a list of topics and process them in a callback function.
 
     This function creates an MQTT client, connects to a broker and subscribes
@@ -97,7 +102,6 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
            "<topic>", 'payload':"<payload">, 'qos':<qos>, 'retain':<retain>}.
            Topic is required, all other parameters are optional and will
            default to None, 0 and False respectively.
-
            Defaults to None, which indicates no will should be used.
 
     :param auth: a dict containing authentication parameters for the client:
@@ -128,16 +132,28 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
                     Defaults to True.
 
     :param proxy_args: a dictionary that will be given to the client.
+
+    :param properties: (MQTT v5.0 only) a Properties instance setting the MQTT
+        v5.0 properties to be included with the subscribe packet. Optional -
+        if not set, no properties are sent.
+
+    :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of
+        user properties to attach to the subscribe packet. These are appended
+        as ``UserProperty`` entries on top of any existing ``properties``.
     """
 
     if qos < 0 or qos > 2:
         raise ValueError('qos must be in the range 0-2')
 
+    properties = _apply_user_properties(properties, user_properties, PacketTypes.SUBSCRIBE)
+
     callback_userdata = {
-        'callback':callback,
-        'topics':topics,
-        'qos':qos,
-        'userdata':userdata}
+        'callback': callback,
+        'topics': topics,
+        'qos': qos,
+        'userdata': userdata,
+        'properties': properties,
+    }
 
     client = paho.Client(
         paho.CallbackAPIVersion.VERSION2,
@@ -185,8 +201,9 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
 
 def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
            port=1883, client_id="", keepalive=60, will=None, auth=None,
-           tls=None, protocol=paho.MQTTv311, transport="tcp",
-           clean_session=True, proxy_args=None):
+           tls=None, protocol=paho.MQTTv50, transport="tcp",
+           clean_session=True, proxy_args=None, properties=None,
+           user_properties=None):
     """Subscribe to a list of topics and return msg_count messages.
 
     This function creates an MQTT client, connects to a broker and subscribes
@@ -242,7 +259,7 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
           processed using the tls_set_context method.
           Defaults to None, which indicates that TLS should not be used.
 
-    :param protocol: the MQTT protocol version to use. Defaults to MQTTv311.
+    :param protocol: the MQTT protocol version to use. Defaults to MQTTv50.
 
     :param transport: set to "tcp" to use the default setting of transport which is
           raw TCP. Set to "websockets" to use WebSockets as the transport.
@@ -256,6 +273,14 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
                     is ignored.
 
     :param proxy_args: a dictionary that will be given to the client.
+
+    :param properties: (MQTT v5.0 only) a Properties instance setting the MQTT
+        v5.0 properties to be included with the subscribe packet. Optional -
+        if not set, no properties are sent.
+
+    :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of
+        user properties to attach to the subscribe packet. These are appended
+        as ``UserProperty`` entries on top of any existing ``properties``.
     """
 
     if msg_count < 1:
@@ -272,10 +297,10 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
     if protocol == paho.MQTTv5:
         clean_session = None
 
-    userdata = {'retained':retained, 'msg_count':msg_count, 'messages':messages}
+    userdata = {'retained': retained, 'msg_count': msg_count, 'messages': messages}
 
     callback(_on_message_simple, topics, qos, userdata, hostname, port,
              client_id, keepalive, will, auth, tls, protocol, transport,
-             clean_session, proxy_args)
+             clean_session, proxy_args, properties, user_properties)
 
     return userdata['messages']

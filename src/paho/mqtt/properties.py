@@ -239,6 +239,41 @@ class Properties:
     def allowsMultiple(self, compressedName):
         return self.getIdentFromName(compressedName) in [11, 38]
 
+    def add_user_properties(self, user_properties: dict[str, str] | None) -> None:
+        """Add user properties (UTF-8 string pairs) to this Properties instance.
+
+        This is a convenience method that accepts a ``dict`` mapping ``{str: str}``
+        and appends each entry as a ``UserProperty`` (property identifier 38).
+        ``None`` or an empty dict is a no-op.
+
+        Example::
+
+            props = Properties(PacketTypes.PUBLISH)
+            props.add_user_properties({"foo": "bar", "baz": "qux"})
+        """
+        if not user_properties:
+            return
+        if not isinstance(user_properties, dict):
+            raise MQTTException("user_properties must be a dict {str: str}.")
+        for k, v in user_properties.items():
+            setattr(self, "UserProperty", (k, v))
+
+    @staticmethod
+    def from_user_properties(packetType, user_properties: dict[str, str] | None) -> "Properties | None":
+        """Create a new :class:`Properties` instance that only contains the given
+        user properties as ``UserProperty`` entries.
+
+        Returns ``None`` when ``user_properties`` is ``None`` or empty, so that
+        callers can easily pass the result as the ``properties`` argument of
+        :meth:`Client.publish` / :meth:`Client.subscribe` / ... without
+        introducing properties when none were requested.
+        """
+        if not user_properties:
+            return None
+        props = Properties(packetType)
+        props.add_user_properties(user_properties)
+        return props
+
     def getIdentFromName(self, compressedName):
         # return the identifier corresponding to the property name
         result = -1

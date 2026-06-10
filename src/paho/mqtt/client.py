@@ -483,6 +483,47 @@ def _encode_payload(payload: str | bytes | bytearray | int | float | None) -> by
     return payload
 
 
+def _apply_user_properties(
+    properties: Properties | None,
+    user_properties: dict[str, str] | None,
+    packet_type: int,
+) -> Properties | None:
+    """Return a ``Properties`` instance which combines ``properties`` (optional)
+    with the ``user_properties`` dict (optional).
+
+    * When neither ``properties`` nor ``user_properties`` are provided, ``None``
+      is returned so that no properties are sent.
+    * When only ``properties`` is provided, it is returned unchanged.
+    * When only ``user_properties`` is provided, a new ``Properties`` is created
+      and filled with ``UserProperty`` entries from the dict.
+    * When both are provided, a *copy* of ``properties`` is made and the user
+      properties from ``user_properties`` are appended to it. The original
+      ``properties`` object is never mutated.
+    """
+    if not user_properties:
+        return properties
+
+    if not isinstance(user_properties, dict):
+        raise ValueError("user_properties must be a dict {str: str}.")
+
+    if properties is None:
+        merged = Properties(packet_type)
+    else:
+        # Clone the existing Properties instance so we don't mutate the caller's
+        # object. Properties does not expose a copy protocol, so we replicate
+        # the properties by packing/unpacking the serialized form.
+        merged = Properties(packet_type)
+        packed = properties.pack()
+        # packed starts with the variable-byte length prefix; skip it by using
+        # the packer's own output which is valid to unpack.
+        merged.unpack(packed)
+
+    for k, v in user_properties.items():
+        merged.UserProperty = (k, v)
+
+    return merged
+
+
 class MQTTMessageInfo:
     """This is a class returned from `Client.publish()` and can be used to find
     out the mid of the message that was published, and to determine whether the
@@ -1713,6 +1754,7 @@ class Client:
         qos: int = 0,
         retain: bool = False,
         properties: Properties | None = None,
+        user_properties: dict[str, str] | None = None,
     ) -> MQTTMessageInfo:
         """Publish a message on a topic.
 
@@ -1729,6 +1771,11 @@ class Client:
         :param bool retain: If set to true, the message will be set as the "last known
             good"/retained message for the topic.
         :param Properties properties: (MQTT v5.0 only) the MQTT v5.0 properties to be included.
+        :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
+            properties to attach to the publish packet. These are appended as
+            ``UserProperty`` entries on top of any existing ``properties``. This is a
+            convenience that avoids having to construct a ``Properties`` object
+            manually.
 
         Returns a `MQTTMessageInfo` class, which can be used to determine whether
         the message has been delivered (using `is_published()`) or to block
@@ -1766,6 +1813,8 @@ class Client:
 
         if len(local_payload) > 268435455:
             raise ValueError('Payload too large.')
+
+        properties = _apply_user_properties(properties, user_properties, PacketTypes.PUBLISH)
 
         local_mid = self._mid_generate()
 
@@ -1897,6 +1946,7 @@ class Client:
         qos: int = 0,
         options: SubscribeOptions | None = None,
         properties: Properties | None = None,
+        user_properties: dict[str, str] | None = None,
     ) -> tuple[MQTTErrorCode, int | None]:
         """Subscribe the client to one or more topics.
 
@@ -1910,6 +1960,7 @@ class Client:
         :qos: The desired quality of service level for the subscription.
             Defaults to 0.
         :options and properties: Not used.
+        :user_properties: Not used.
 
         Simple string and subscribe options (MQTT v5.0 only)
         ----------------------------------------------------
@@ -1920,6 +1971,9 @@ class Client:
         :options: The MQTT v5.0 subscribe options.
         :properties: a Properties instance setting the MQTT v5.0 properties
             to be included. Optional - if not set, no properties are sent.
+        :user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
+            properties to attach to the subscribe packet. These are appended as
+            ``UserProperty`` entries on top of any existing ``properties``.
 
         String and integer tuple
         ------------------------
@@ -1930,6 +1984,8 @@ class Client:
         :qos and options: Not used.
         :properties: Only used for MQTT v5.0.  A Properties instance setting the
             MQTT v5.0 properties. Optional - if not set, no properties are sent.
+        :user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
+            properties to attach to the subscribe packet.
 
         String and subscribe options tuple (MQTT v5.0 only)
         ---------------------------------------------------
@@ -1940,6 +1996,8 @@ class Client:
         :qos and options: Not used.
         :properties: a Properties instance setting the MQTT v5.0 properties
             to be included. Optional - if not set, no properties are sent.
+        :user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
+            properties.
 
         List of string and integer tuples
         ---------------------------------
@@ -1952,6 +2010,7 @@ class Client:
         :topic: A list of tuple of format (topic, qos). Both topic and qos must
                be present in all of the tuples.
         :qos, options and properties: Not used.
+        :user_properties: Not used.
 
         List of string and subscribe option tuples (MQTT v5.0 only)
         -----------------------------------------------------------
@@ -1966,6 +2025,8 @@ class Client:
         :qos and options: Not used.
         :properties: a Properties instance setting the MQTT v5.0 properties
             to be included. Optional - if not set, no properties are sent.
+        :user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
+            properties.
 
         The function returns a tuple (result, mid), where result is
         MQTT_ERR_SUCCESS to indicate success or (MQTT_ERR_NO_CONN, None) if the
@@ -1977,6 +2038,8 @@ class Client:
         Raises a ValueError if qos is not 0, 1 or 2, or if topic is None or has
         zero string length, or if topic is not a string, tuple or list.
         """
+        properties = _apply_user_properties(properties, user_properties, PacketTypes.SUBSCRIBE)
+
         topic_qos_list = None
 
         if isinstance(topic, tuple):
@@ -2038,7 +2101,10 @@ class Client:
         return self._send_subscribe(False, topic_qos_list, properties)
 
     def unsubscribe(
-        self, topic: str | list[str], properties: Properties | None = None
+        self,
+        topic: str | list[str],
+        properties: Properties | None = None,
+        user_properties: dict[str, str] | None = None,
     ) -> tuple[MQTTErrorCode, int | None]:
         """Unsubscribe the client from one or more topics.
 
@@ -2046,6 +2112,8 @@ class Client:
             topics to unsubscribe from.
         :param properties: (MQTT v5.0 only) a Properties instance setting the MQTT v5.0 properties
             to be included. Optional - if not set, no properties are sent.
+        :param user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
+            properties to attach to the unsubscribe packet.
 
         Returns a tuple (result, mid), where result is MQTT_ERR_SUCCESS
         to indicate success or (MQTT_ERR_NO_CONN, None) if the client is not
@@ -2057,6 +2125,8 @@ class Client:
         :raises ValueError: if topic is None or has zero string length, or is
             not a string or list.
         """
+        properties = _apply_user_properties(properties, user_properties, PacketTypes.UNSUBSCRIBE)
+
         topic_list = None
         if topic is None:
             raise ValueError('Invalid topic.')
@@ -2197,6 +2267,7 @@ class Client:
         qos: int = 0,
         retain: bool = False,
         properties: Properties | None = None,
+        user_properties: dict[str, str] | None = None,
     ) -> None:
         """Set a Will to be sent by the broker in case the client disconnects unexpectedly.
 
@@ -2213,6 +2284,9 @@ class Client:
             good"/retained message for the topic.
         :param Properties properties: (MQTT v5.0 only) the MQTT v5.0 properties
             to be included with the will message. Optional - if not set, no properties are sent.
+        :param dict user_properties: (MQTT v5.0 only) a ``{str: str}`` mapping of user
+            properties to attach to the will message. These are appended as
+            ``UserProperty`` entries on top of any existing ``properties``.
 
         :raises ValueError: if qos is not 0, 1 or 2, or if topic is None or has
             zero string length.
@@ -2229,6 +2303,8 @@ class Client:
         if properties and not isinstance(properties, Properties):
             raise ValueError(
                 "The properties argument must be an instance of the Properties class.")
+
+        properties = _apply_user_properties(properties, user_properties, PacketTypes.WILLMESSAGE)
 
         self._will_payload = _encode_payload(payload)
         self._will = True

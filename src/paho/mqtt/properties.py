@@ -419,3 +419,36 @@ class Properties:
                     f"Property '{property}' must not exist more than once")
             setattr(self, propname, value)
         return self, propslen + VBIlen
+
+
+def merge_user_properties(
+    packet_type: int,
+    properties: Properties | None,
+    user_properties: dict[str, str],
+) -> Properties:
+    """Merge a user_properties dict into a Properties object.
+
+    This is a convenience helper that allows users to pass a simple dict
+    of key-value pairs instead of manually creating a Properties object
+    and setting UserProperty tuples one by one.
+
+    Usage::
+
+        props = merge_user_properties(
+            PacketTypes.PUBLISH,
+            existing_properties,
+            {"key1": "value1", "key2": "value2"}
+        )
+
+    :param packet_type: MQTT packet type identifier (e.g. PacketTypes.PUBLISH).
+    :param properties: An optional existing Properties object. If None, a new
+        Properties will be created.
+    :param user_properties: A dict of string key-value pairs to be added as
+        UserProperty entries.
+    :returns: The Properties object (new or passed-in) with UserProperty entries.
+    """
+    if properties is None:
+        properties = Properties(packet_type)
+    for key, value in user_properties.items():
+        properties.UserProperty = (str(key), str(value))
+    return properties

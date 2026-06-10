@@ -63,6 +63,8 @@ if TYPE_CHECKING:
         payload: NotRequired[paho.PayloadType]
         qos: NotRequired[int]
         retain: NotRequired[bool]
+        properties: NotRequired[Properties]
+        user_properties: NotRequired[dict[str, str]]
 
     MessageTuple = Tuple[str, paho.PayloadType, int, bool]
 
@@ -115,6 +117,7 @@ def multiple(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    user_properties: dict[str, str] | None = None,
 ) -> None:
     """Publish multiple messages to a broker, then disconnect cleanly.
 
@@ -177,12 +180,25 @@ def multiple(
           raw TCP. Set to "websockets" to use WebSockets as the transport.
 
     :param proxy_args: a dictionary that will be given to the client.
+    :param dict user_properties: (MQTT v5.0 only) a dict of string key-value pairs
+        to be added as UserProperty entries to each published message. This is a
+        convenient alternative to manually constructing a Properties object.
+        Per-message user_properties in message dicts take precedence.
     """
 
     if not isinstance(msgs, Iterable):
         raise TypeError('msgs must be an iterable')
     if len(msgs) == 0:
         raise ValueError('msgs is empty')
+
+    if user_properties is not None:
+        enriched_msgs = []
+        for msg in msgs:
+            if isinstance(msg, dict) and 'user_properties' not in msg:
+                msg = dict(msg)
+                msg['user_properties'] = user_properties
+            enriched_msgs.append(msg)
+        msgs = enriched_msgs
 
     client = paho.Client(
         CallbackAPIVersion.VERSION2,
@@ -243,6 +259,8 @@ def single(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    user_properties: dict[str, str] | None = None,
+    properties: Properties | None = None,
 ) -> None:
     """Publish a single message to a broker, then disconnect cleanly.
 
@@ -298,9 +316,17 @@ def single(
           raw TCP. Set to "websockets" to use WebSockets as the transport.
 
     :param proxy_args: a dictionary that will be given to the client.
+    :param dict user_properties: (MQTT v5.0 only) a dict of string key-value pairs
+        to be added as UserProperty entries. This is a convenient alternative to
+        manually constructing a Properties object.
+    :param Properties properties: (MQTT v5.0 only) the MQTT v5.0 properties to be included.
     """
 
     msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
+    if user_properties is not None:
+        msg['user_properties'] = user_properties
+    if properties is not None:
+        msg['properties'] = properties
 
     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
              protocol, transport, proxy_args)

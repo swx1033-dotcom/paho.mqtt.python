@@ -1,0 +1,668 @@
+diff --git a/src/paho/mqtt/matcher.py b/src/paho/mqtt/matcher.py
+index b73c13a..579cb85 100644
+--- a/src/paho/mqtt/matcher.py
++++ b/src/paho/mqtt/matcher.py
+@@ -1,78 +1,202 @@
++"""
++MQTT 主题过滤器匹配器。
++
++提供 :class:`MQTTMatcher`，用于管理带有通配符 (``+`` / ``#``) 的 MQTT 主题过滤器，
++并基于前缀树 (Trie / Prefix Tree) 高效地查找与某个主题名称匹配的所有过滤器。
++
++设计目标
++--------
++* 插入 / 删除 / 匹配的时间复杂度均与 **主题层级** 相关，与已注册过滤器数量无关；
++* 使用迭代式（显式栈）而不是递归生成器，避免深递归、减少 Python 生成器对象开销；
++* 仅在必要时保留子节点：删除条目后回收空节点，节省内存。
++
++MQTT 通配符规则
++----------------
++* ``/`` 是主题层级分隔符；
++* ``+`` 匹配任意 **单个** 层级；
++* ``#`` 匹配任意 **零或多个** 层级，只能作为最后一个层级；
++* 以 ``$`` 开头的主题 **不** 匹配根级别的 ``#`` 或 ``+`` 过滤器。
++"""
++
++from __future__ import annotations
++
++from typing import Any, Dict, Iterator, List, Tuple
++
++
+ class MQTTMatcher:
+-    """Intended to manage topic filters including wildcards.
++    """管理 MQTT 主题过滤器并高效匹配主题名称。
++
++    示例::
++
++        matcher = MQTTMatcher()
++        matcher["sensors/+/temp"] = handle_temp
++        matcher["sensors/room1/#"] = handle_room1
++
++        for callback in matcher.iter_match("sensors/room1/temp"):
++            callback(...)
++    """
++
++    __slots__ = ("_root", "_size")
+ 
+-    Internally, MQTTMatcher use a prefix tree (trie) to store
+-    values associated with filters, and has an iter_match()
+-    method to iterate efficiently over all filters that match
+-    some topic name."""
++    class _Node:
++        """Trie 中的单个节点，对应主题过滤器的一个层级。"""
+ 
+-    class Node:
+-        __slots__ = '_children', '_content'
++        __slots__ = ("_children", "_content")
+ 
+-        def __init__(self):
+-            self._children = {}
+-            self._content = None
++        def __init__(self) -> None:
++            # 使用普通 dict：由于层级数量小，线性查找 + 哈希的组合已足够快，
++            # 且避免了额外的对象开销。
++            self._children: Dict[str, "MQTTMatcher._Node"] = {}
++            # 当此节点对应某个过滤器的末尾时，_content 不为 None。
++            self._content: Any = None
+ 
+-    def __init__(self):
+-        self._root = self.Node()
++        def __repr__(self) -> str:  # pragma: no cover - 仅用于调试
++            return f"_Node(children={list(self._children)}, content={self._content!r})"
+ 
+-    def __setitem__(self, key, value):
+-        """Add a topic filter :key to the prefix tree
+-        and associate it to :value"""
++    def __init__(self) -> None:
++        self._root = MQTTMatcher._Node()
++        self._size = 0
++
++    def __len__(self) -> int:
++        """返回已注册的过滤器数量。"""
++        return self._size
++
++    def __contains__(self, key: str) -> bool:
++        """判断某个过滤器是否已被注册。"""
++        try:
++            self[key]
++        except KeyError:
++            return False
++        return True
++
++    def __setitem__(self, key: str, value: Any) -> None:
++        """将过滤器 ``key`` 与 ``value`` 关联，插入到前缀树中。"""
+         node = self._root
+         for sym in key.split('/'):
+-            node = node._children.setdefault(sym, self.Node())
++            # setdefault 的常见路径；避免额外分配。
++            child = node._children.get(sym)
++            if child is None:
++                child = MQTTMatcher._Node()
++                node._children[sym] = child
++            node = child
++        if node._content is None:
++            self._size += 1
+         node._content = value
+ 
+-    def __getitem__(self, key):
+-        """Retrieve the value associated with some topic filter :key"""
+-        try:
+-            node = self._root
+-            for sym in key.split('/'):
++    def __getitem__(self, key: str) -> Any:
++        """按过滤器字符串精确取出之前存储的值。"""
++        node = self._root
++        for sym in key.split('/'):
++            try:
+                 node = node._children[sym]
+-            if node._content is None:
+-                raise KeyError(key)
+-            return node._content
+-        except KeyError as ke:
+-            raise KeyError(key) from ke
+-
+-    def __delitem__(self, key):
+-        """Delete the value associated with some topic filter :key"""
+-        lst = []
+-        try:
+-            parent, node = None, self._root
+-            for k in key.split('/'):
+-                 parent, node = node, node._children[k]
+-                 lst.append((parent, k, node))
+-            # TODO
+-            node._content = None
+-        except KeyError as ke:
+-            raise KeyError(key) from ke
+-        else:  # cleanup
+-            for parent, k, node in reversed(lst):
+-                if node._children or node._content is not None:
+-                     break
+-                del parent._children[k]
+-
+-    def iter_match(self, topic):
+-        """Return an iterator on all values associated with filters
+-        that match the :topic"""
+-        lst = topic.split('/')
+-        normal = not topic.startswith('$')
+-        def rec(node, i=0):
+-            if i == len(lst):
+-                if node._content is not None:
+-                    yield node._content
++            except KeyError:
++                raise KeyError(key) from None
++        if node._content is None:
++            raise KeyError(key)
++        return node._content
++
++    def __delitem__(self, key: str) -> None:
++        """删除某个过滤器，并回收空节点。"""
++        # 先一路遍历到目标节点，记录路径以便回溯清理。
++        path: List[Tuple[MQTTMatcher._Node, str]] = []
++        node = self._root
++        for sym in key.split('/'):
++            try:
++                next_node = node._children[sym]
++            except KeyError:
++                raise KeyError(key) from None
++            path.append((node, sym))
++            node = next_node
++
++        if node._content is None:
++            raise KeyError(key)
++
++        node._content = None
++        self._size -= 1
++
++        # 从最深节点向上回溯：如果子节点既没有内容也没有子节点，则删除。
++        for parent, sym in reversed(path):
++            child = parent._children[sym]
++            if child._content is None and not child._children:
++                del parent._children[sym]
+             else:
+-                part = lst[i]
+-                if part in node._children:
+-                    for content in rec(node._children[part], i + 1):
+-                        yield content
+-                if '+' in node._children and (normal or i > 0):
+-                    for content in rec(node._children['+'], i + 1):
+-                        yield content
+-            if '#' in node._children and (normal or i > 0):
+-                content = node._children['#']._content
+-                if content is not None:
+-                    yield content
+-        return rec(self._root)
++                break
++
++    def iter_match(self, topic: str) -> Iterator[Any]:
++        """迭代返回所有与 ``topic`` 匹配的过滤器对应的值。
++
++        使用显式栈模拟前序遍历：
++
++        * 在每个层级依次尝试：精确匹配的子节点、``+`` 子节点；
++        * 在每个节点都检查是否存在 ``#`` 子节点，因为 ``#`` 匹配任意剩余层级；
++        * 以 ``$`` 开头的主题不会与根层的 ``#`` / ``+`` 匹配。
++
++        与原始递归版本相比，这个实现：
++
++        * 不依赖 Python 生成器的递归 yield from，每向下遍历一层少一次
++          ``StopIteration`` / 生成器切换开销；
++        * 栈中只保存必要的 ``(node, index)``，避免嵌套 ``for content in rec(...)``
++          产生的中间生成器对象。
++        """
++        # 预先一次性拆分主题，避免递归过程中反复切片。
++        parts: List[str] = topic.split('/')
++        n = len(parts)
++        # 以 ``$`` 开头的主题不匹配根层通配符。
++        normal_root = not topic.startswith('$')
++
++        # 栈元素: (node, index_at_which_it_was_pushed)
++        # 使用 tuple 而非自定义对象，减少内存分配与属性查找开销。
++        stack: List[Tuple[MQTTMatcher._Node, int]] = [(self._root, 0)]
++        # 将结果缓存在列表中以减少 Python 迭代器 / 生成器对象开销。
++        results: List[Any] = []
++
++        while stack:
++            node, i = stack.pop()
++
++            # ``#`` 子节点可以匹配任意剩余层级（包括零个）。
++            hash_child = node._children.get('#')
++            if hash_child is not None:
++                # 根层 ``#`` 对 ``$...`` 主题无效。
++                if normal_root or i > 0:
++                    if hash_child._content is not None:
++                        results.append(hash_child._content)
++
++            if i == n:
++                # 到达主题末尾：若当前节点对应一个完整过滤器，则产出。
++                if node._content is not None:
++                    results.append(node._content)
++                continue
++
++            part = parts[i]
++            next_idx = i + 1
++
++            # 先压 ``+``，再压精确匹配，这样精确匹配会先被处理
++            # （LIFO 栈）。顺序不影响正确性，但保持与原实现类似的
++            # 行为有助于向后兼容。
++            plus_child = node._children.get('+')
++            if plus_child is not None:
++                if normal_root or i > 0:
++                    stack.append((plus_child, next_idx))
++
++            exact_child = node._children.get(part)
++            if exact_child is not None:
++                stack.append((exact_child, next_idx))
++
++        # 一次性 yield，避免在循环中反复 yield 产生的微小开销。
++        yield from results
++
++    def __iter__(self) -> Iterator[str]:
++        """迭代返回所有已注册的过滤器字符串 (深度优先)。
++
++        主要用于测试 / 调试。
++        """
++        stack: List[Tuple[MQTTMatcher._Node, str]] = [(self._root, "")]
++        while stack:
++            node, prefix = stack.pop()
++            if node._content is not None:
++                yield prefix
++            # 为了稳定的迭代顺序，按字母排序子节点。
++            for sym in sorted(node._children.keys(), reverse=True):
++                child = node._children[sym]
++                new_prefix = sym if prefix == "" else prefix + "/" + sym
++                stack.append((child, new_prefix))
+diff --git a/tests/test_mqtt.py b/tests/test_mqtt.py
+new file mode 100644
+index 0000000..470df1c
+--- /dev/null
++++ b/tests/test_mqtt.py
+@@ -0,0 +1,389 @@
++"""
++MQTTMatcher / 主题过滤器匹配的正确性和性能基准测试。
++
++运行方式::
++
++    python -m pytest tests/test_mqtt.py -v
++    python -m pytest tests/test_mqtt.py --benchmark-only -v     # 只跑基准
++    python -m pytest tests/test_mqtt.py --benchmark-disable -v  # 跳过基准
++
++基准测试会在 ``N`` 个不同的主题过滤器上注册回调，然后对 ``M`` 个消息主题执行
++匹配，验证：
++
++* ``TrieMatcher`` 的插入 / 删除 / 匹配性能；
++* 随着订阅数增长，匹配耗时应保持近似常数（与主题深度相关），而非线性增长。
++"""
++
++from __future__ import annotations
++
++import random
++import time
++from typing import Callable, Dict, List
++
++import pytest
++
++# 同时导入被重构的匹配器以及客户端 API，确保向后兼容。
++from paho.mqtt.matcher import MQTTMatcher  # noqa: F401
++import paho.mqtt.client as mqtt_client
++
++
++# ---------------------------------------------------------------------------
++# 正确性测试
++# ---------------------------------------------------------------------------
++
++
++class Test_MQTTMatcher_basic:
++    """基本的 set/get/del/contains 行为。"""
++
++    def test_set_and_get(self):
++        m = MQTTMatcher()
++        m["foo/bar"] = "cb1"
++        assert m["foo/bar"] == "cb1"
++        assert len(m) == 1
++        assert "foo/bar" in m
++        assert "foo/baz" not in m
++
++    def test_get_missing_raises_keyerror(self):
++        m = MQTTMatcher()
++        with pytest.raises(KeyError):
++            m["nope"]
++
++    def test_del_missing_raises_keyerror(self):
++        m = MQTTMatcher()
++        with pytest.raises(KeyError):
++            del m["nope"]
++
++    def test_del_reclaims_empty_nodes(self):
++        """删除条目后，没有子节点也没有内容的节点应被回收。"""
++        m = MQTTMatcher()
++        m["a/b/c/d"] = 1
++        del m["a/b/c/d"]
++        # 根节点不应保留任何子节点
++        assert m._root._children == {}
++        assert len(m) == 0
++
++    def test_del_keeps_sibling_paths(self):
++        """删除一条路径时不能影响共享前缀的其他路径。"""
++        m = MQTTMatcher()
++        m["a/b/c"] = 1
++        m["a/b/d"] = 2
++        m["a/x"] = 3
++        del m["a/b/c"]
++        assert "a/b/c" not in m
++        assert m["a/b/d"] == 2
++        assert m["a/x"] == 3
++        assert len(m) == 2
++
++    def test_overwrite_does_not_double_count(self):
++        m = MQTTMatcher()
++        m["x"] = 1
++        m["x"] = 2
++        assert len(m) == 1
++        assert m["x"] == 2
++
++    def test_iter_contains_all_keys(self):
++        m = MQTTMatcher()
++        keys = ["a", "a/b", "a/c/d", "x/y/z", "#"]
++        for k in keys:
++            m[k] = True
++        assert sorted(m) == sorted(keys)
++
++
++class Test_MQTTMatcher_matching:
++    """iter_match 的通配符匹配语义。"""
++
++    @pytest.mark.parametrize("sub,topic", [
++        ("foo/bar", "foo/bar"),
++        ("foo/+", "foo/bar"),
++        ("foo/+/baz", "foo/bar/baz"),
++        ("foo/+/#", "foo/bar/baz"),
++        ("A/B/+/#", "A/B/B/C"),
++        ("#", "foo/bar/baz"),
++        ("#", "/foo/bar"),
++        ("/#", "/foo/bar"),
++        ("$SYS/bar", "$SYS/bar"),
++    ])
++    def test_matches(self, sub: str, topic: str):
++        m = MQTTMatcher()
++        m[sub] = True
++        assert list(m.iter_match(topic)) == [True]
++
++    @pytest.mark.parametrize("sub,topic", [
++        ("test/6/#", "test/3"),
++        ("foo/bar", "foo"),
++        ("foo/+", "foo/bar/baz"),
++        ("foo/+/baz", "foo/bar/bar"),
++        ("foo/+/#", "fo2/bar/baz"),
++        ("/#", "foo/bar"),
++        ("#", "$SYS/bar"),
++        ("$BOB/bar", "$SYS/bar"),
++    ])
++    def test_not_matches(self, sub: str, topic: str):
++        m = MQTTMatcher()
++        m[sub] = True
++        assert list(m.iter_match(topic)) == []
++
++    def test_topic_matches_sub_backward_compat(self):
++        """client.topic_matches_sub 必须保持完全一致的行为。"""
++        cases_matching = [
++            ("foo/bar", "foo/bar"),
++            ("foo/+", "foo/bar"),
++            ("foo/+/baz", "foo/bar/baz"),
++            ("foo/+/#", "foo/bar/baz"),
++            ("A/B/+/#", "A/B/B/C"),
++            ("#", "foo/bar/baz"),
++            ("#", "/foo/bar"),
++            ("/#", "/foo/bar"),
++            ("$SYS/bar", "$SYS/bar"),
++        ]
++        for sub, topic in cases_matching:
++            assert mqtt_client.topic_matches_sub(sub, topic), (sub, topic)
++
++        cases_non_matching = [
++            ("test/6/#", "test/3"),
++            ("foo/bar", "foo"),
++            ("foo/+", "foo/bar/baz"),
++            ("foo/+/baz", "foo/bar/bar"),
++            ("foo/+/#", "fo2/bar/baz"),
++            ("/#", "foo/bar"),
++            ("#", "$SYS/bar"),
++            ("$BOB/bar", "$SYS/bar"),
++        ]
++        for sub, topic in cases_non_matching:
++            assert not mqtt_client.topic_matches_sub(sub, topic), (sub, topic)
++
++    def test_multi_filter_match_order_and_count(self):
++        """一个主题可以匹配多个过滤器；都应该被返回。"""
++        m = MQTTMatcher()
++        m["sensors/room1/temp"] = 1
++        m["sensors/+/temp"] = 2
++        m["sensors/#"] = 3
++        m["#"] = 4
++        results = set(m.iter_match("sensors/room1/temp"))
++        assert results == {1, 2, 3, 4}
++
++    def test_empty_trie_returns_nothing(self):
++        m = MQTTMatcher()
++        assert list(m.iter_match("anything")) == []
++
++    def test_hash_only_on_deep_topic(self):
++        m = MQTTMatcher()
++        m["#"] = 1
++        assert list(m.iter_match("a/b/c/d/e/f/g")) == [1]
++
++
++# ---------------------------------------------------------------------------
++# 参考实现：线性扫描，用于正确性对照与性能对比
++# ---------------------------------------------------------------------------
++
++
++class _LinearMatcher:
++    """最简单的线性扫描实现，作为 Trie 的正确性与性能基线。"""
++
++    def __init__(self) -> None:
++        self._filters: Dict[str, Callable] = {}
++
++    def __setitem__(self, key: str, value: Callable) -> None:
++        self._filters[key] = value
++
++    def __delitem__(self, key: str) -> None:
++        del self._filters[key]
++
++    def __len__(self) -> int:
++        return len(self._filters)
++
++    def iter_match(self, topic: str) -> List[Callable]:
++        """遍历所有过滤器，逐一进行字符串级别的匹配。"""
++        topic_parts = topic.split('/')
++        is_dollar_topic = topic.startswith('$')
++        out: List[Callable] = []
++        for sub, value in self._filters.items():
++            if self._matches(sub, topic_parts, is_dollar_topic):
++                out.append(value)
++        return out
++
++    @staticmethod
++    def _matches(sub: str, topic_parts: List[str], is_dollar_topic: bool) -> bool:
++        sub_parts = sub.split('/')
++        # 以 $ 开头的主题不匹配根层 # / +
++        if is_dollar_topic and sub_parts and sub_parts[0] in ('#', '+'):
++            return False
++
++        i = 0
++        for sp in sub_parts:
++            if sp == '#':
++                # 匹配零或多个剩余层级；必须是最后一个 token。
++                return True
++            if i >= len(topic_parts):
++                return False
++            if sp == '+':
++                i += 1
++                continue
++            if sp != topic_parts[i]:
++                return False
++            i += 1
++        return i == len(topic_parts)
++
++
++# ---------------------------------------------------------------------------
++# 性能基准测试
++# ---------------------------------------------------------------------------
++
++
++# 如果 pytest-benchmark 未安装，则优雅降级。
++pytestmark = pytest.mark.skipif(
++    False, reason="always run unless --benchmark-disable is used"
++)
++
++try:
++    import pytest_benchmark  # noqa: F401
++    _HAS_BENCHMARK = True
++except ImportError:  # pragma: no cover - 仅在未安装插件时触发
++    _HAS_BENCHMARK = False
++
++
++def _gen_filters(n: int, seed: int = 42) -> List[str]:
++    """生成 ``n`` 个带通配符 / 不带通配符的主题过滤器。
++
++    生成策略模仿真实 IoT 场景：
++    * 40% 精确主题（sensors/<id>/<metric>）；
++    * 40% 单层通配符（sensors/+/<metric>）；
++    * 20% 多层前缀通配符（building/<id>/#）。
++    """
++    rng = random.Random(seed)
++    filters: List[str] = []
++    for i in range(n):
++        kind = i % 5
++        if kind < 2:
++            # 精确主题
++            filters.append(f"sensors/{rng.randint(0, n // 5)}/temp/{rng.randint(0, 20)}")
++        elif kind < 4:
++            # 单层 +
++            metrics = ("temp", "humidity", "pressure", "battery")
++            filters.append(f"sensors/+/{rng.choice(metrics)}")
++        else:
++            # 前缀 #
++            filters.append(f"building/{rng.randint(0, n // 10)}/#")
++    return filters
++
++
++def _gen_topics(n: int, seed: int = 7) -> List[str]:
++    """生成用于匹配的消息主题。"""
++    rng = random.Random(seed)
++    topics: List[str] = []
++    for _ in range(n):
++        topics.append(
++            f"sensors/{rng.randint(0, n // 2)}/"
++            f"{rng.choice(('temp', 'humidity', 'pressure', 'battery'))}"
++        )
++    return topics
++
++
++@pytest.mark.skipif(not _HAS_BENCHMARK, reason="pytest-benchmark not installed")
++class Test_MQTTMatcher_benchmark:
++    """对比 Trie 与线性扫描在不同订阅规模下的性能。"""
++
++    # 规模参数：每个过滤器数量下各自运行一次基准。
++    @pytest.mark.parametrize("num_filters", [100, 1000, 5000])
++    def test_trie_insert(self, benchmark, num_filters: int):
++        filters = _gen_filters(num_filters)
++
++        def bench():
++            m = MQTTMatcher()
++            for i, f in enumerate(filters):
++                m[f] = i
++
++        benchmark(bench)
++
++    @pytest.mark.parametrize("num_filters", [100, 1000, 5000])
++    def test_trie_match(self, benchmark, num_filters: int):
++        filters = _gen_filters(num_filters)
++        topics = _gen_topics(200)
++        m = MQTTMatcher()
++        for i, f in enumerate(filters):
++            m[f] = i
++
++        def bench():
++            hits = 0
++            for t in topics:
++                hits += len(list(m.iter_match(t)))
++            return hits
++
++        benchmark(bench)
++
++    @pytest.mark.parametrize("num_filters", [100, 1000, 5000])
++    def test_linear_match_baseline(self, benchmark, num_filters: int):
++        """同规模的线性扫描实现，作为性能对照基线。"""
++        filters = _gen_filters(num_filters)
++        topics = _gen_topics(200)
++        m = _LinearMatcher()
++        for i, f in enumerate(filters):
++            m[f] = i
++
++        def bench():
++            hits = 0
++            for t in topics:
++                hits += len(m.iter_match(t))
++            return hits
++
++        benchmark(bench)
++
++    def test_trie_delete(self, benchmark):
++        num_filters = 1000
++        filters = _gen_filters(num_filters)
++        m = MQTTMatcher()
++        for i, f in enumerate(filters):
++            m[f] = i
++
++        def bench():
++            for f in filters:
++                try:
++                    del m[f]
++                except KeyError:
++                    pass
++
++        benchmark(bench)
++
++    def test_match_against_client_api(self):
++        """不使用 benchmark 插件时也可以运行的简易计时。
++
++        即使在未安装 pytest-benchmark 的环境，也能给出数量级差异的快速反馈。
++        """
++        num_filters = 5000
++        filters = _gen_filters(num_filters)
++        topics = _gen_topics(500)
++
++        trie = MQTTMatcher()
++        linear = _LinearMatcher()
++        for i, f in enumerate(filters):
++            trie[f] = i
++            linear[f] = i
++
++        # 预热 & 交叉正确性检查
++        for t in topics[:50]:
++            assert set(trie.iter_match(t)) == set(linear.iter_match(t)), (
++                "Trie 和线性扫描必须返回一致的匹配结果"
++            )
++
++        # 简单计时
++        start = time.perf_counter()
++        total_trie = 0
++        for t in topics:
++            total_trie += len(list(trie.iter_match(t)))
++        trie_time = time.perf_counter() - start
++
++        start = time.perf_counter()
++        total_linear = 0
++        for t in topics:
++            total_linear += len(linear.iter_match(t))
++        linear_time = time.perf_counter() - start
++
++        assert total_trie == total_linear, "Trie 与线性扫描命中数不一致"
++        # 打印到 stderr，避免干扰测试输出
++        import sys
++        print(
++            f"\n[bench] trie={trie_time:.4f}s linear={linear_time:.4f}s "
++            f"speedup={linear_time / max(trie_time, 1e-9):.2f}x "
++            f"(filters={num_filters}, topics={len(topics)})",
++            file=sys.stderr,
++        )

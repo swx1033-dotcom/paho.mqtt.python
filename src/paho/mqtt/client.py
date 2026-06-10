@@ -159,6 +159,8 @@ LOGGING_LEVEL = {
     LogLevel.MQTT_LOG_ERR: logging.ERROR,
 }
 
+_LOGGER = logging.getLogger('paho.mqtt.client')
+
 # CONNACK codes
 CONNACK_ACCEPTED = ConnackCode.CONNACK_ACCEPTED
 CONNACK_REFUSED_PROTOCOL_VERSION = ConnackCode.CONNACK_REFUSED_PROTOCOL_VERSION
@@ -797,6 +799,8 @@ class Client:
         else:
             self._client_id = _force_bytes(client_id)
 
+        self._logger_adapter = logging.LoggerAdapter(_LOGGER, {'client_id': self._client_id.decode()})
+
         self._username: bytes | None = None
         self._password: bytes | None = None
         self._in_packet: _InPacket = {
@@ -854,8 +858,8 @@ class Client:
         self._ssl_context: ssl.SSLContext | None = None
         # Only used when SSL context does not have check_hostname attribute
         self._tls_insecure = False
-        self._logger: logging.Logger | None = None
         self._registered_write = False
+        self._logger_adapter: logging.LoggerAdapter[logging.Logger]  # set after _client_id
         # No default callbacks
         self._on_log: CallbackOnLog | None = None
         self._on_pre_connect: CallbackOnPreConnect | None = None
@@ -1083,12 +1087,23 @@ class Client:
         return self._will_payload
 
     @property
-    def logger(self) -> logging.Logger | None:
-        return self._logger
+    def logger(self) -> logging.LoggerAdapter[logging.Logger]:
+        return self._logger_adapter
 
     @logger.setter
-    def logger(self, value: logging.Logger | None) -> None:
-        self._logger = value
+    def logger(self, value: logging.LoggerAdapter[logging.Logger] | logging.Logger | None) -> None:
+        warnings.warn(
+            "Setting a custom logger is deprecated. Configure the 'paho.mqtt.client' "
+            "logger using standard Python logging facilities instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if isinstance(value, logging.LoggerAdapter):
+            self._logger_adapter = value
+        elif isinstance(value, logging.Logger):
+            self._logger_adapter = logging.LoggerAdapter(value, {'client_id': self._client_id.decode()})
+        elif value is None:
+            pass
 
     def _sock_recv(self, bufsize: int) -> bytes:
         if self._sock is None:
@@ -1369,26 +1384,27 @@ class Client:
             self._proxy = proxy_args
 
     def enable_logger(self, logger: logging.Logger | None = None) -> None:
-        """
-        Enables a logger to send log messages to
-
-        :param logging.Logger logger: if specified, that ``logging.Logger`` object will be used, otherwise
-            one will be created automatically.
-
-        See `disable_logger` to undo this action.
-        """
-        if logger is None:
-            if self._logger is not None:
-                # Do not replace existing logger
-                return
-            logger = logging.getLogger(__name__)
-        self.logger = logger
+        warnings.warn(
+            "enable_logger() is deprecated. Configure the 'paho.mqtt.client' logger "
+            "using standard Python logging facilities instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if not _LOGGER.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s [%(client_id)s] %(message)s'))
+            _LOGGER.addHandler(handler)
+            _LOGGER.setLevel(logging.DEBUG)
 
     def disable_logger(self) -> None:
-        """
-        Disable logging using standard python logging package. This has no effect on the `on_log` callback.
-        """
-        self._logger = None
+        warnings.warn(
+            "disable_logger() is deprecated. Configure the 'paho.mqtt.client' logger "
+            "using standard Python logging facilities instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        for handler in _LOGGER.handlers[:]:
+            _LOGGER.removeHandler(handler)
 
     def connect(
         self,
@@ -2378,7 +2394,8 @@ class Client:
     @property
     def on_log(self) -> CallbackOnLog | None:
         """The callback called when the client has log information.
-        Defined to allow debugging.
+        **Deprecated** - the logging system now uses the standard Python logging module.
+        Configure the 'paho.mqtt.client' logger using standard logging facilities instead.
 
         Expected signature is::
 
@@ -2394,13 +2411,31 @@ class Client:
         Decorator: @client.log_callback() (``client`` is the name of the
             instance which this callback is being attached to)
         """
+        warnings.warn(
+            "on_log callback is deprecated. Configure the 'paho.mqtt.client' logger "
+            "using standard Python logging facilities instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._on_log
 
     @on_log.setter
     def on_log(self, func: CallbackOnLog | None) -> None:
+        warnings.warn(
+            "on_log callback is deprecated. Configure the 'paho.mqtt.client' logger "
+            "using standard Python logging facilities instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._on_log = func
 
     def log_callback(self) -> Callable[[CallbackOnLog], CallbackOnLog]:
+        warnings.warn(
+            "log_callback() is deprecated. Configure the 'paho.mqtt.client' logger "
+            "using standard Python logging facilities instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         def decorator(func: CallbackOnLog) -> CallbackOnLog:
             self.on_log = func
             return func
@@ -3247,16 +3282,8 @@ class Client:
         return MQTTErrorCode.MQTT_ERR_SUCCESS
 
     def _easy_log(self, level: LogLevel, fmt: str, *args: Any) -> None:
-        if self.on_log is not None:
-            buf = fmt % args
-            try:
-                self.on_log(self, self._userdata, level, buf)
-            except Exception:  # noqa: S110
-                # Can't _easy_log this, as we'll recurse until we break
-                pass  # self._logger will pick this up, so we're fine
-        if self._logger is not None:
-            level_std = LOGGING_LEVEL[level]
-            self._logger.log(level_std, fmt, *args)
+        level_std = LOGGING_LEVEL[level]
+        self._logger_adapter.log(level_std, fmt, *args)
 
     def _check_keepalive(self) -> None:
         if self._keepalive == 0:

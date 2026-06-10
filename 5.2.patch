@@ -1,0 +1,183 @@
+diff --git a/src/paho/mqtt/client.py b/src/paho/mqtt/client.py
+index 4ccc869..9ea3ac1 100644
+--- a/src/paho/mqtt/client.py
++++ b/src/paho/mqtt/client.py
+@@ -1713,6 +1713,7 @@ class Client:
+         qos: int = 0,
+         retain: bool = False,
+         properties: Properties | None = None,
++        user_properties: dict | None = None,
+     ) -> MQTTMessageInfo:
+         """Publish a message on a topic.
+ 
+@@ -1762,6 +1763,8 @@ class Client:
+         if qos < 0 or qos > 2:
+             raise ValueError('Invalid QoS level.')
+ 
++        properties = Properties.setup_user_properties(properties, PacketTypes.PUBLISH, user_properties)
++
+         local_payload = _encode_payload(payload)
+ 
+         if len(local_payload) > 268435455:
+@@ -1897,6 +1900,7 @@ class Client:
+         qos: int = 0,
+         options: SubscribeOptions | None = None,
+         properties: Properties | None = None,
++        user_properties: dict | None = None,
+     ) -> tuple[MQTTErrorCode, int | None]:
+         """Subscribe the client to one or more topics.
+ 
+@@ -2035,6 +2039,8 @@ class Client:
+         if self._sock is None:
+             return (MQTT_ERR_NO_CONN, None)
+ 
++        properties = Properties.setup_user_properties(properties, PacketTypes.SUBSCRIBE, user_properties)
++
+         return self._send_subscribe(False, topic_qos_list, properties)
+ 
+     def unsubscribe(
+diff --git a/src/paho/mqtt/properties.py b/src/paho/mqtt/properties.py
+index f307b86..38507e3 100644
+--- a/src/paho/mqtt/properties.py
++++ b/src/paho/mqtt/properties.py
+@@ -151,6 +151,20 @@ class Properties:
+ 
+     """
+ 
++    @classmethod
++    def setup_user_properties(cls, properties, packet_type, user_properties):
++        """Helper method to convert a dict of user properties to a Properties object or update an existing one."""
++        if user_properties is None:
++            return properties
++
++        if properties is None:
++            properties = cls(packet_type)
++
++        for k, v in user_properties.items():
++            properties.UserProperty = (k, str(v))
++
++        return properties
++
+     def __init__(self, packetType):
+         self.packetType = packetType
+         self.types = ["Byte", "Two Byte Integer", "Four Byte Integer", "Variable Byte Integer",
+diff --git a/src/paho/mqtt/publish.py b/src/paho/mqtt/publish.py
+index 333c190..86b0b5e 100644
+--- a/src/paho/mqtt/publish.py
++++ b/src/paho/mqtt/publish.py
+@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, List, Tuple, Union
+ 
+ from paho.mqtt.enums import CallbackAPIVersion, MQTTProtocolVersion
+ from paho.mqtt.properties import Properties
++from paho.mqtt.packettypes import PacketTypes
+ from paho.mqtt.reasoncodes import ReasonCode
+ 
+ from .. import mqtt
+@@ -63,6 +64,8 @@ if TYPE_CHECKING:
+         payload: NotRequired[paho.PayloadType]
+         qos: NotRequired[int]
+         retain: NotRequired[bool]
++        properties: NotRequired[Properties]
++        user_properties: NotRequired[dict]
+ 
+     MessageTuple = Tuple[str, paho.PayloadType, int, bool]
+ 
+@@ -115,6 +118,8 @@ def multiple(
+     protocol: MQTTProtocolVersion = paho.MQTTv311,
+     transport: Literal["tcp", "websockets"] = "tcp",
+     proxy_args: Any | None = None,
++    properties: Properties | None = None,
++    user_properties: dict | None = None,
+ ) -> None:
+     """Publish multiple messages to a broker, then disconnect cleanly.
+ 
+@@ -224,7 +229,8 @@ def multiple(
+             # Assume input is SSLContext object
+             client.tls_set_context(tls)
+ 
+-    client.connect(hostname, port, keepalive)
++    properties = Properties.setup_user_properties(properties, PacketTypes.CONNECT, user_properties)
++    client.connect(hostname, port, keepalive, properties=properties)
+     client.loop_forever()
+ 
+ 
+@@ -243,6 +249,8 @@ def single(
+     protocol: MQTTProtocolVersion = paho.MQTTv311,
+     transport: Literal["tcp", "websockets"] = "tcp",
+     proxy_args: Any | None = None,
++    properties: Properties | None = None,
++    user_properties: dict | None = None,
+ ) -> None:
+     """Publish a single message to a broker, then disconnect cleanly.
+ 
+@@ -301,6 +309,10 @@ def single(
+     """
+ 
+     msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
++    if properties is not None:
++        msg['properties'] = properties
++    if user_properties is not None:
++        msg['user_properties'] = user_properties
+ 
+     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
+              protocol, transport, proxy_args)
+diff --git a/src/paho/mqtt/subscribe.py b/src/paho/mqtt/subscribe.py
+index b6c80f4..1274302 100644
+--- a/src/paho/mqtt/subscribe.py
++++ b/src/paho/mqtt/subscribe.py
+@@ -28,11 +28,14 @@ def _on_connect(client, userdata, flags, reason_code, properties):
+     if reason_code != 0:
+         raise mqtt.MQTTException(paho.connack_string(reason_code))
+ 
++    sub_properties = userdata.get('properties')
++    user_properties = userdata.get('user_properties')
++
+     if isinstance(userdata['topics'], list):
+         for topic in userdata['topics']:
+-            client.subscribe(topic, userdata['qos'])
++            client.subscribe(topic, userdata['qos'], properties=sub_properties, user_properties=user_properties)
+     else:
+-        client.subscribe(userdata['topics'], userdata['qos'])
++        client.subscribe(userdata['topics'], userdata['qos'], properties=sub_properties, user_properties=user_properties)
+ 
+ 
+ def _on_message_callback(client, userdata, message):
+@@ -65,7 +68,8 @@ def _on_message_simple(client, userdata, message):
+ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+              port=1883, client_id="", keepalive=60, will=None, auth=None,
+              tls=None, protocol=paho.MQTTv311, transport="tcp",
+-             clean_session=True, proxy_args=None):
++             clean_session=True, proxy_args=None, properties=None,
++             user_properties=None):
+     """Subscribe to a list of topics and process them in a callback function.
+ 
+     This function creates an MQTT client, connects to a broker and subscribes
+@@ -137,7 +141,9 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+         'callback':callback,
+         'topics':topics,
+         'qos':qos,
+-        'userdata':userdata}
++        'userdata':userdata,
++        'properties': properties,
++        'user_properties': user_properties}
+ 
+     client = paho.Client(
+         paho.CallbackAPIVersion.VERSION2,
+@@ -186,7 +192,8 @@ def callback(callback, topics, qos=0, userdata=None, hostname="localhost",
+ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+            port=1883, client_id="", keepalive=60, will=None, auth=None,
+            tls=None, protocol=paho.MQTTv311, transport="tcp",
+-           clean_session=True, proxy_args=None):
++           clean_session=True, proxy_args=None, properties=None,
++           user_properties=None):
+     """Subscribe to a list of topics and return msg_count messages.
+ 
+     This function creates an MQTT client, connects to a broker and subscribes
+@@ -276,6 +283,6 @@ def simple(topics, qos=0, msg_count=1, retained=True, hostname="localhost",
+ 
+     callback(_on_message_simple, topics, qos, userdata, hostname, port,
+              client_id, keepalive, will, auth, tls, protocol, transport,
+-             clean_session, proxy_args)
++             clean_session, proxy_args, properties, user_properties)
+ 
+     return userdata['messages']

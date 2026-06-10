@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, List, Tuple, Union
 
 from paho.mqtt.enums import CallbackAPIVersion, MQTTProtocolVersion
 from paho.mqtt.properties import Properties
+from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
 from .. import mqtt
@@ -63,6 +64,8 @@ if TYPE_CHECKING:
         payload: NotRequired[paho.PayloadType]
         qos: NotRequired[int]
         retain: NotRequired[bool]
+        properties: NotRequired[Properties]
+        user_properties: NotRequired[dict]
 
     MessageTuple = Tuple[str, paho.PayloadType, int, bool]
 
@@ -115,6 +118,8 @@ def multiple(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    properties: Properties | None = None,
+    user_properties: dict | None = None,
 ) -> None:
     """Publish multiple messages to a broker, then disconnect cleanly.
 
@@ -224,7 +229,8 @@ def multiple(
             # Assume input is SSLContext object
             client.tls_set_context(tls)
 
-    client.connect(hostname, port, keepalive)
+    properties = Properties.setup_user_properties(properties, PacketTypes.CONNECT, user_properties)
+    client.connect(hostname, port, keepalive, properties=properties)
     client.loop_forever()
 
 
@@ -243,6 +249,8 @@ def single(
     protocol: MQTTProtocolVersion = paho.MQTTv311,
     transport: Literal["tcp", "websockets"] = "tcp",
     proxy_args: Any | None = None,
+    properties: Properties | None = None,
+    user_properties: dict | None = None,
 ) -> None:
     """Publish a single message to a broker, then disconnect cleanly.
 
@@ -301,6 +309,10 @@ def single(
     """
 
     msg: MessageDict = {'topic':topic, 'payload':payload, 'qos':qos, 'retain':retain}
+    if properties is not None:
+        msg['properties'] = properties
+    if user_properties is not None:
+        msg['user_properties'] = user_properties
 
     multiple([msg], hostname, port, client_id, keepalive, will, auth, tls,
              protocol, transport, proxy_args)

@@ -151,6 +151,20 @@ class Properties:
 
     """
 
+    @classmethod
+    def setup_user_properties(cls, properties, packet_type, user_properties):
+        """Helper method to convert a dict of user properties to a Properties object or update an existing one."""
+        if user_properties is None:
+            return properties
+
+        if properties is None:
+            properties = cls(packet_type)
+
+        for k, v in user_properties.items():
+            properties.UserProperty = (k, str(v))
+
+        return properties
+
     def __init__(self, packetType):
         self.packetType = packetType
         self.types = ["Byte", "Two Byte Integer", "Four Byte Integer", "Variable Byte Integer",

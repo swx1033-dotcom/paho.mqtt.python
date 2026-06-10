@@ -1713,6 +1713,7 @@ class Client:
         qos: int = 0,
         retain: bool = False,
         properties: Properties | None = None,
+        user_properties: dict | None = None,
     ) -> MQTTMessageInfo:
         """Publish a message on a topic.
 
@@ -1761,6 +1762,8 @@ class Client:
 
         if qos < 0 or qos > 2:
             raise ValueError('Invalid QoS level.')
+
+        properties = Properties.setup_user_properties(properties, PacketTypes.PUBLISH, user_properties)
 
         local_payload = _encode_payload(payload)
 
@@ -1897,6 +1900,7 @@ class Client:
         qos: int = 0,
         options: SubscribeOptions | None = None,
         properties: Properties | None = None,
+        user_properties: dict | None = None,
     ) -> tuple[MQTTErrorCode, int | None]:
         """Subscribe the client to one or more topics.
 
@@ -2034,6 +2038,8 @@ class Client:
 
         if self._sock is None:
             return (MQTT_ERR_NO_CONN, None)
+
+        properties = Properties.setup_user_properties(properties, PacketTypes.SUBSCRIBE, user_properties)
 
         return self._send_subscribe(False, topic_qos_list, properties)
 

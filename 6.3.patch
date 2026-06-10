@@ -1,0 +1,390 @@
+diff --git a/src/paho/mqtt/matcher.py b/src/paho/mqtt/matcher.py
+index b73c13a..4d8ae2c 100644
+--- a/src/paho/mqtt/matcher.py
++++ b/src/paho/mqtt/matcher.py
+@@ -6,6 +6,8 @@ class MQTTMatcher:
+     method to iterate efficiently over all filters that match
+     some topic name."""
+ 
++    __slots__ = '_root',
++
+     class Node:
+         __slots__ = '_children', '_content'
+ 
+@@ -44,7 +46,6 @@ class MQTTMatcher:
+             for k in key.split('/'):
+                  parent, node = node, node._children[k]
+                  lst.append((parent, k, node))
+-            # TODO
+             node._content = None
+         except KeyError as ke:
+             raise KeyError(key) from ke
+@@ -59,20 +60,32 @@ class MQTTMatcher:
+         that match the :topic"""
+         lst = topic.split('/')
+         normal = not topic.startswith('$')
+-        def rec(node, i=0):
+-            if i == len(lst):
+-                if node._content is not None:
+-                    yield node._content
+-            else:
+-                part = lst[i]
+-                if part in node._children:
+-                    for content in rec(node._children[part], i + 1):
+-                        yield content
+-                if '+' in node._children and (normal or i > 0):
+-                    for content in rec(node._children['+'], i + 1):
+-                        yield content
+-            if '#' in node._children and (normal or i > 0):
+-                content = node._children['#']._content
++        n = len(lst)
++
++        stack = [(self._root, 0)]
++        _pop = stack.pop
++        _append = stack.append
++
++        while stack:
++            node, i = _pop()
++
++            if i == n:
++                content = node._content
+                 if content is not None:
+                     yield content
+-        return rec(self._root)
++                continue
++
++            part = lst[i]
++            children = node._children
++
++            if part in children:
++                _append((children[part], i + 1))
++
++            if '+' in children and (normal or i > 0):
++                _append((children['+'], i + 1))
++
++            if '#' in children and (normal or i > 0):
++                hash_node = children['#']
++                hash_content = hash_node._content
++                if hash_content is not None:
++                    _append((hash_node, n))
+diff --git a/tests/test_mqtt.py b/tests/test_mqtt.py
+new file mode 100644
+index 0000000..26be5a5
+--- /dev/null
++++ b/tests/test_mqtt.py
+@@ -0,0 +1,314 @@
++import time
++import paho.mqtt.client as client
++from paho.mqtt.matcher import MQTTMatcher
++import pytest
++
++
++def _measure_time(func, iterations=100):
++    start = time.perf_counter()
++    for _ in range(iterations):
++        func()
++    end = time.perf_counter()
++    return (end - start) / iterations
++
++
++class TestTopicMatchesSub:
++    """
++    测试 topic_matches_sub 函数的正确性（内部使用 MQTTMatcher）
++    """
++
++    @pytest.mark.parametrize("sub,topic", [
++        ("foo/bar", "foo/bar"),
++        ("foo/+", "foo/bar"),
++        ("foo/+/baz", "foo/bar/baz"),
++        ("foo/+/#", "foo/bar/baz"),
++        ("A/B/+/#", "A/B/B/C"),
++        ("#", "foo/bar/baz"),
++        ("#", "/foo/bar"),
++        ("/#", "/foo/bar"),
++        ("$SYS/bar", "$SYS/bar"),
++        ("+/bar", "foo/bar"),
++        ("a/+/+/d", "a/b/c/d"),
++        ("a/b/c/#", "a/b/c/d/e/f"),
++        ("sport/tennis/#", "sport/tennis/player1"),
++        ("sport/tennis/+/ranking", "sport/tennis/player1/ranking"),
++        ("+/+/+/+", "a/b/c/d"),
++    ])
++    def test_matching(self, sub, topic):
++        assert client.topic_matches_sub(sub, topic)
++
++    @pytest.mark.parametrize("sub,topic", [
++        ("test/6/#", "test/3"),
++        ("foo/bar", "foo"),
++        ("foo/+", "foo/bar/baz"),
++        ("foo/+/baz", "foo/bar/bar"),
++        ("foo/+/#", "fo2/bar/baz"),
++        ("/#", "foo/bar"),
++        ("#", "$SYS/bar"),
++        ("$BOB/bar", "$SYS/bar"),
++        ("+/bar", "foo/bar/baz"),
++        ("a/+/c", "a/b"),
++        ("a/b/c", "a/b"),
++    ])
++    def test_not_matching(self, sub, topic):
++        assert not client.topic_matches_sub(sub, topic)
++
++
++class TestMQTTMatcherCorrectness:
++    """MQTTMatcher Trie 树正确性测试"""
++
++    def test_exact_match(self):
++        m = MQTTMatcher()
++        m['a/b/c'] = 1
++        matched = list(m.iter_match('a/b/c'))
++        assert matched == [1]
++
++    def test_no_match(self):
++        m = MQTTMatcher()
++        m['a/b/c'] = 1
++        matched = list(m.iter_match('x/y/z'))
++        assert matched == []
++
++    def test_single_level_wildcard(self):
++        m = MQTTMatcher()
++        m['a/+/c'] = 1
++        matched = list(m.iter_match('a/b/c'))
++        assert matched == [1]
++
++    def test_multi_level_wildcard_hash(self):
++        m = MQTTMatcher()
++        m['a/#'] = 1
++        matched = list(m.iter_match('a/b/c'))
++        assert matched == [1]
++        matched = list(m.iter_match('a/b/c/d/e'))
++        assert matched == [1]
++
++    def test_root_hash(self):
++        m = MQTTMatcher()
++        m['#'] = 1
++        matched = list(m.iter_match('a/b/c'))
++        assert matched == [1]
++
++    def test_mixed_wildcards(self):
++        m = MQTTMatcher()
++        m['a/+/#'] = 1
++        matched = list(m.iter_match('a/b/c/d'))
++        assert matched == [1]
++
++    def test_multiple_matches_order(self):
++        m = MQTTMatcher()
++        results = []
++        m['sport/tennis/player1/#'] = lambda: results.append(1)
++        m['sport/tennis/player1/ranking'] = lambda: results.append(2)
++        m['sport/tennis/+/ranking'] = lambda: results.append(3)
++        m['sport/#'] = lambda: results.append(4)
++        for cb in m.iter_match('sport/tennis/player1/ranking'):
++            cb()
++        assert results == [2, 3, 1, 4]
++
++    def test_dollar_topic_wildcard(self):
++        m = MQTTMatcher()
++        m['#'] = 1
++        m['+/bar'] = 2
++        m['$SYS/#'] = 3
++        matched = list(m.iter_match('$SYS/test'))
++        assert matched == [3]
++        matched = list(m.iter_match('foo/bar'))
++        assert set(matched) == {1, 2}
++
++    def test_empty_topic_level(self):
++        m = MQTTMatcher()
++        m['/foo'] = 1
++        matched = list(m.iter_match('/foo'))
++        assert matched == [1]
++
++    def test_trailing_slash(self):
++        m = MQTTMatcher()
++        m['a/b/'] = 1
++        matched = list(m.iter_match('a/b/'))
++        assert matched == [1]
++        matched = list(m.iter_match('a/b'))
++        assert matched == []
++        m['a/#'] = 2
++        matched = list(m.iter_match('a/b/'))
++        assert matched == [2, 1]
++
++    def test_store_and_retrieve(self):
++        m = MQTTMatcher()
++        m['a/b'] = 42
++        assert m['a/b'] == 42
++
++    def test_delete(self):
++        m = MQTTMatcher()
++        m['a/b/c'] = 10
++        m['a/b'] = 20
++        del m['a/b/c']
++        with pytest.raises(KeyError):
++            _ = m['a/b/c']
++        assert m['a/b'] == 20
++        matched = list(m.iter_match('a/b/c'))
++        assert matched == [20]
++
++    def test_overwrite(self):
++        m = MQTTMatcher()
++        m['a/b'] = 1
++        m['a/b'] = 2
++        assert m['a/b'] == 2
++
++
++class TestMQTTMatcherPerformance:
++    """MQTTMatcher Trie 树性能基准测试"""
++
++    def test_exact_match_performance_many_subscriptions(self):
++        m = MQTTMatcher()
++        num_subs = 1000
++        for i in range(num_subs):
++            m[f'sensor/{i}/temperature'] = i
++
++        def _match():
++            return list(m.iter_match('sensor/500/temperature'))
++
++        elapsed = _measure_time(_match, iterations=500)
++        result = _match()
++        assert len(result) == 1
++        assert result[0] == 500
++        print(f"\n  Exact match ({num_subs} subs): {elapsed*1e6:.2f} us/op")
++
++    def test_wildcard_match_performance(self):
++        m = MQTTMatcher()
++        num_subs = 500
++        for i in range(num_subs):
++            m[f'building/{i}/+/status'] = i
++
++        def _match():
++            return list(m.iter_match('building/250/sensor1/status'))
++
++        elapsed = _measure_time(_match, iterations=200)
++        result = _match()
++        assert len(result) == 1
++        assert result[0] == 250
++        print(f"\n  Wildcard (+) match ({num_subs} subs): {elapsed*1e6:.2f} us/op")
++
++    def test_hash_wildcard_performance(self):
++        m = MQTTMatcher()
++        num_subs = 500
++        for i in range(num_subs):
++            m[f'home/{i}/#'] = i
++
++        def _match():
++            return list(m.iter_match('home/250/device/light/kitchen'))
++
++        elapsed = _measure_time(_match, iterations=200)
++        result = _match()
++        assert len(result) == 1
++        assert result[0] == 250
++        print(f"\n  Hash (#) match ({num_subs} subs): {elapsed*1e6:.2f} us/op")
++
++    def test_no_match_performance(self):
++        m = MQTTMatcher()
++        num_subs = 1000
++        for i in range(num_subs):
++            m[f'sensor/{i}/data'] = i
++
++        def _match():
++            return list(m.iter_match('nonexistent/topic/path'))
++
++        elapsed = _measure_time(_match, iterations=500)
++        result = _match()
++        assert len(result) == 0
++        print(f"\n  No-match ({num_subs} subs): {elapsed*1e6:.2f} us/op")
++
++    def test_many_exact_matches_with_one_hash(self):
++        m = MQTTMatcher()
++        num_subs = 500
++        for i in range(num_subs):
++            m[f'device/{i}/sensor/+/value'] = i
++        m['device/#'] = num_subs
++
++        def _match():
++            return list(m.iter_match('device/300/sensor/temperature/value'))
++
++        elapsed = _measure_time(_match, iterations=200)
++        result = _match()
++        assert len(result) == 2
++        assert 300 in result
++        assert num_subs in result
++        print(f"\n  Mixed match ({num_subs} subs): {elapsed*1e6:.2f} us/op")
++
++    def test_insert_performance(self):
++        def _insert():
++            m = MQTTMatcher()
++            for i in range(500):
++                m[f'a/b/c/d/e/f/g/h/{i}'] = i
++            return m
++
++        elapsed = _measure_time(_insert, iterations=50)
++        print(f"\n  Insert 500 topics (depth 9): {elapsed*1e3:.2f} ms/op")
++
++    def test_deep_topic_match(self):
++        m = MQTTMatcher()
++        deep_topic = '/'.join([f'level{i}' for i in range(20)])
++        m[deep_topic] = 1
++
++        def _match():
++            return list(m.iter_match(deep_topic))
++
++        elapsed = _measure_time(_match, iterations=500)
++        result = _match()
++        assert result == [1]
++        print(f"\n  Deep topic (20 levels): {elapsed*1e6:.2f} us/op")
++
++    def test_many_subscriptions_stress(self):
++        m = MQTTMatcher()
++        num_subs = 5000
++
++        start = time.perf_counter()
++        for i in range(num_subs):
++            if i % 3 == 0:
++                m[f'area/{i}/sensor/#'] = i
++            elif i % 3 == 1:
++                m[f'area/{i}/sensor/+/value'] = i
++            else:
++                m[f'area/{i}/sensor/temperature'] = i
++        insert_time = time.perf_counter() - start
++
++        def _match_exact():
++            return list(m.iter_match('area/2500/sensor/temperature'))
++
++        def _match_plus():
++            return list(m.iter_match('area/2501/sensor/ambient/value'))
++
++        def _match_hash():
++            return list(m.iter_match('area/2502/sensor/deep/nested/value'))
++
++        exact_time = _measure_time(_match_exact, iterations=100)
++        plus_time = _measure_time(_match_plus, iterations=100)
++        hash_time = _measure_time(_match_hash, iterations=100)
++
++        print(f"\n  Insert {num_subs} mixed subs: {insert_time*1e3:.2f} ms")
++        print(f"  Exact match: {exact_time*1e6:.2f} us")
++        print(f"  Plus match:  {plus_time*1e6:.2f} us")
++        print(f"  Hash match:  {hash_time*1e6:.2f} us")
++
++    def test_trie_scalability(self):
++        for num_subs in [100, 500, 1000, 2000]:
++            m = MQTTMatcher()
++            for i in range(num_subs):
++                m[f'device/{i}/metric'] = i
++
++            def _match():
++                return list(m.iter_match(f'device/{num_subs//2}/metric'))
++
++            elapsed = _measure_time(_match, iterations=200)
++            print(f"\n  {num_subs:>5} subs, exact match: {elapsed*1e6:.2f} us/op")
++
++    def test_client_topic_matches_sub_benchmark(self):
++        subs = [f'sensor/{i}/temperature' for i in range(200)]
++        topic = 'sensor/100/temperature'
++
++        def _match():
++            for sub in subs:
++                client.topic_matches_sub(sub, topic)
++
++        elapsed = _measure_time(_match, iterations=50)
++        print(f"\n  topic_matches_sub (200 checks): {elapsed*1e6:.2f} us/op")
+\ No newline at end of file

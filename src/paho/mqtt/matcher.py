@@ -6,6 +6,8 @@ class MQTTMatcher:
     method to iterate efficiently over all filters that match
     some topic name."""
 
+    __slots__ = '_root',
+
     class Node:
         __slots__ = '_children', '_content'
 
@@ -44,7 +46,6 @@ class MQTTMatcher:
             for k in key.split('/'):
                  parent, node = node, node._children[k]
                  lst.append((parent, k, node))
-            # TODO
             node._content = None
         except KeyError as ke:
             raise KeyError(key) from ke
@@ -59,20 +60,32 @@ class MQTTMatcher:
         that match the :topic"""
         lst = topic.split('/')
         normal = not topic.startswith('$')
-        def rec(node, i=0):
-            if i == len(lst):
-                if node._content is not None:
-                    yield node._content
-            else:
-                part = lst[i]
-                if part in node._children:
-                    for content in rec(node._children[part], i + 1):
-                        yield content
-                if '+' in node._children and (normal or i > 0):
-                    for content in rec(node._children['+'], i + 1):
-                        yield content
-            if '#' in node._children and (normal or i > 0):
-                content = node._children['#']._content
+        n = len(lst)
+
+        stack = [(self._root, 0)]
+        _pop = stack.pop
+        _append = stack.append
+
+        while stack:
+            node, i = _pop()
+
+            if i == n:
+                content = node._content
                 if content is not None:
                     yield content
-        return rec(self._root)
+                continue
+
+            part = lst[i]
+            children = node._children
+
+            if part in children:
+                _append((children[part], i + 1))
+
+            if '+' in children and (normal or i > 0):
+                _append((children['+'], i + 1))
+
+            if '#' in children and (normal or i > 0):
+                hash_node = children['#']
+                hash_content = hash_node._content
+                if hash_content is not None:
+                    _append((hash_node, n))
